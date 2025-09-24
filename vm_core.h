@@ -846,13 +846,13 @@ typedef struct rb_vm_struct {
 #define RUBY_VM_THREAD_MACHINE_STACK_SIZE     ( 128 * 1024 * sizeof(VALUE)) /*  512 KB or 1024 KB */
 #define RUBY_VM_THREAD_MACHINE_STACK_SIZE_MIN (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
 
-#define RUBY_VM_FIBER_VM_STACK_SIZE           (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
-#define RUBY_VM_FIBER_VM_STACK_SIZE_MIN       (   2 * 1024 * sizeof(VALUE)) /*    8 KB or   16 KB */
-#define RUBY_VM_FIBER_MACHINE_STACK_SIZE      (  64 * 1024 * sizeof(VALUE)) /*  256 KB or  512 KB */
+#define RUBY_VM_FIBER_VM_STACK_SIZE           (  64 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
+#define RUBY_VM_FIBER_VM_STACK_SIZE_MIN       (   8 * 1024 * sizeof(VALUE)) /*    8 KB or   16 KB */
+#define RUBY_VM_FIBER_MACHINE_STACK_SIZE      ( 256 * 1024 * sizeof(VALUE)) /*  256 KB or  512 KB */
 #if defined(__powerpc64__) || defined(__ppc64__) // macOS has __ppc64__
-#define RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN  (  32 * 1024 * sizeof(VALUE)) /*  128 KB or  256 KB */
+#define RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN  ( 128 * 1024 * sizeof(VALUE)) /*  128 KB or  256 KB */
 #else
-#define RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN  (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
+#define RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN  (  64 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
 #endif
 
 #if __has_feature(memory_sanitizer) || __has_feature(address_sanitizer)
@@ -862,9 +862,9 @@ typedef struct rb_vm_struct {
 #undef  RUBY_VM_THREAD_MACHINE_STACK_SIZE_MIN
 #define RUBY_VM_THREAD_MACHINE_STACK_SIZE_MIN ( 512 * 1024 * sizeof(VALUE))
 #undef  RUBY_VM_FIBER_MACHINE_STACK_SIZE
-#define RUBY_VM_FIBER_MACHINE_STACK_SIZE      ( 256 * 1024 * sizeof(VALUE))
+#define RUBY_VM_FIBER_MACHINE_STACK_SIZE      ( 512 * 1024 * sizeof(VALUE))
 #undef  RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN
-#define RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN  ( 128 * 1024 * sizeof(VALUE))
+#define RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN  ( 256 * 1024 * sizeof(VALUE))
 #endif
 
 #ifndef VM_DEBUG_BP_CHECK

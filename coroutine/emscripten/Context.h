@@ -31,7 +31,7 @@ struct coroutine_context
 
 COROUTINE coroutine_trampoline(void * _context);
 
-#define MAIN_ASYNCIFY_STACK_SIZE 65536
+#define MAIN_ASYNCIFY_STACK_SIZE 8388608
 static inline void coroutine_initialize_main(struct coroutine_context * context) {
     static char asyncify_stack[MAIN_ASYNCIFY_STACK_SIZE];
     emscripten_fiber_init_from_current_context(&context->state, asyncify_stack, MAIN_ASYNCIFY_STACK_SIZE);
