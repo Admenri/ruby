@@ -4761,20 +4761,39 @@ gettimeofday(struct timeval *tv, struct timezone *tz)
     return 0;
 }
 
-#ifdef NEED_CLOCK_GETTIME
+/* License: Ruby's */
+static FILETIME
+filetimes_plus(FILETIME t1, FILETIME t2)
+{
+    ULARGE_INTEGER i1 = {.u = {.LowPart = t1.dwLowDateTime, .HighPart = t1.dwHighDateTime}};
+    ULARGE_INTEGER i2 = {.u = {.LowPart = t2.dwLowDateTime, .HighPart = t2.dwHighDateTime}};
+    ULARGE_INTEGER i = {.QuadPart = i1.QuadPart + i2.QuadPart};
+    return (FILETIME){.dwLowDateTime = i.LowPart, .dwHighDateTime = i.HighPart};
+}
+
+static void
+filetime_to_timespec(FILETIME ft, struct timespec *sp)
+{
+    long subsec;
+    sp->tv_sec = filetime_split(&ft, &subsec);
+    sp->tv_nsec = subsec * 100;
+}
+
+/* License: Ruby's */
+static const long secs_in_ns = 1000000000;
+
 /* License: Ruby's */
 int
 clock_gettime(clockid_t clock_id, struct timespec *sp)
 {
     switch (clock_id) {
       case CLOCK_REALTIME:
+      case CLOCK_REALTIME_COARSE:
         {
             FILETIME ft;
-            long subsec;
 
             GetSystemTimePreciseAsFileTime(&ft);
-            sp->tv_sec = filetime_split(&ft, &subsec);
-            sp->tv_nsec = subsec * 100;
+            filetime_to_timespec(ft, sp);
             return 0;
         }
       case CLOCK_MONOTONIC:
@@ -4790,10 +4809,28 @@ clock_gettime(clockid_t clock_id, struct timespec *sp)
                 return -1;
             }
             sp->tv_sec = count.QuadPart / freq.QuadPart;
-            if (freq.QuadPart < 1000000000)
-                sp->tv_nsec = (count.QuadPart % freq.QuadPart) * 1000000000 / freq.QuadPart;
+            if (freq.QuadPart < secs_in_ns)
+                sp->tv_nsec = (count.QuadPart % freq.QuadPart) * secs_in_ns / freq.QuadPart;
             else
-                sp->tv_nsec = (long)((count.QuadPart % freq.QuadPart) * (1000000000.0 / freq.QuadPart));
+                sp->tv_nsec = (long)((count.QuadPart % freq.QuadPart) * ((double)secs_in_ns / freq.QuadPart));
+            return 0;
+        }
+      case CLOCK_PROCESS_CPUTIME_ID:
+      case CLOCK_THREAD_CPUTIME_ID:
+        {
+            FILETIME ct, et, kt, ut;
+            BOOL ok;
+            if (clock_id == CLOCK_PROCESS_CPUTIME_ID) {
+                ok = GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut);
+            }
+            else {
+                ok = GetThreadTimes(GetCurrentThread(), &ct, &et, &kt, &ut);
+            }
+            if (!ok) {
+                errno = map_errno(GetLastError());
+                return -1;
+            }
+            filetime_to_timespec(filetimes_plus(kt, ut), sp);
             return 0;
         }
       default:
@@ -4801,15 +4838,14 @@ clock_gettime(clockid_t clock_id, struct timespec *sp)
         return -1;
     }
 }
-#endif
 
-#ifdef NEED_CLOCK_GETRES
 /* License: Ruby's */
 int
 clock_getres(clockid_t clock_id, struct timespec *sp)
 {
     switch (clock_id) {
       case CLOCK_REALTIME:
+      case CLOCK_REALTIME_COARSE:
         {
             sp->tv_sec = 0;
             sp->tv_nsec = 1000;
@@ -4823,7 +4859,15 @@ clock_getres(clockid_t clock_id, struct timespec *sp)
                 return -1;
             }
             sp->tv_sec = 0;
-            sp->tv_nsec = (long)(1000000000.0 / freq.QuadPart);
+            sp->tv_nsec = (long)((double)secs_in_ns / freq.QuadPart);
+            return 0;
+        }
+      case CLOCK_PROCESS_CPUTIME_ID:
+      case CLOCK_THREAD_CPUTIME_ID:
+        {
+            const int frames_in_sec = 60;
+            sp->tv_sec = 0;
+            sp->tv_nsec = (long)(secs_in_ns / frames_in_sec);
             return 0;
         }
       default:
@@ -4831,7 +4875,6 @@ clock_getres(clockid_t clock_id, struct timespec *sp)
         return -1;
     }
 }
-#endif
 
 /* License: Ruby's */
 static char *
@@ -6793,46 +6836,53 @@ constat_attr(int count, const int *seq, WORD attr, WORD default_attr, int *rever
           case 1:
             bold = FOREGROUND_INTENSITY;
             break;
+          case 22:
+            bold = 0;
+            break;
           case 4:
 #ifndef COMMON_LVB_UNDERSCORE
 #define COMMON_LVB_UNDERSCORE 0x8000
 #endif
             attr |= COMMON_LVB_UNDERSCORE;
             break;
+          case 24:
+            attr &= ~COMMON_LVB_UNDERSCORE;
+            break;
           case 7:
             rev = 1;
+            break;
+          case 27:
+            rev = 0;
             break;
 
           case 30:
             attr &= ~(FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_RED);
             break;
-          case 17:
           case 31:
             attr = (attr & ~(FOREGROUND_BLUE | FOREGROUND_GREEN)) | FOREGROUND_RED;
             break;
-          case 18:
           case 32:
             attr = (attr & ~(FOREGROUND_BLUE | FOREGROUND_RED)) | FOREGROUND_GREEN;
             break;
-          case 19:
           case 33:
             attr = (attr & ~FOREGROUND_BLUE) | FOREGROUND_GREEN | FOREGROUND_RED;
             break;
-          case 20:
           case 34:
             attr = (attr & ~(FOREGROUND_GREEN | FOREGROUND_RED)) | FOREGROUND_BLUE;
             break;
-          case 21:
           case 35:
             attr = (attr & ~FOREGROUND_GREEN) | FOREGROUND_BLUE | FOREGROUND_RED;
             break;
-          case 22:
           case 36:
             attr = (attr & ~FOREGROUND_RED) | FOREGROUND_BLUE | FOREGROUND_GREEN;
             break;
-          case 23:
           case 37:
             attr |= FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_RED;
+            break;
+          case 38: /* 256-color or true color; N/A on old Command Prompt */
+            break;
+          case 39:
+            attr = (attr & ~FOREGROUND_MASK) | (default_attr & FOREGROUND_MASK);
             break;
 
           case 40:
@@ -6858,6 +6908,11 @@ constat_attr(int count, const int *seq, WORD attr, WORD default_attr, int *rever
             break;
           case 47:
             attr |= BACKGROUND_BLUE | BACKGROUND_GREEN | BACKGROUND_RED;
+            break;
+          case 48: /* 256-color or true color; N/A on old Command Prompt */
+            break;
+          case 49:
+            attr = (attr & ~BACKGROUND_MASK) | (default_attr & BACKGROUND_MASK);
             break;
         }
     }

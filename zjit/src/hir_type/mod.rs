@@ -2,13 +2,13 @@
 
 #![allow(non_upper_case_globals)]
 use crate::cruby::{rb_block_param_proxy, Qfalse, Qnil, Qtrue, RUBY_T_ARRAY, RUBY_T_CLASS, RUBY_T_HASH, RUBY_T_MODULE, RUBY_T_STRING, VALUE};
-use crate::cruby::{rb_cInteger, rb_cFloat, rb_cArray, rb_cHash, rb_cString, rb_cSymbol, rb_cObject, rb_cTrueClass, rb_cFalseClass, rb_cNilClass, rb_cRange, rb_cSet, rb_cRegexp, rb_cClass, rb_cModule, rb_zjit_singleton_class_p};
+use crate::cruby::{rb_cInteger, rb_cFloat, rb_cArray, rb_cHash, rb_cString, rb_cSymbol, rb_cRange, rb_cModule, rb_zjit_singleton_class_p};
 use crate::cruby::ClassRelationship;
 use crate::cruby::get_class_name;
 use crate::cruby::ruby_sym_to_rust_string;
 use crate::cruby::rb_mRubyVMFrozenCore;
 use crate::cruby::rb_obj_class;
-use crate::hir::PtrPrintMap;
+use crate::hir::{Const, PtrPrintMap};
 use crate::profile::ProfiledType;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -95,6 +95,7 @@ fn write_spec(f: &mut std::fmt::Formatter, printer: &TypePrinter) -> std::fmt::R
         Specialization::Int(val) if ty.is_subtype(types::CUInt16) => write!(f, "[{}]", val >> 48),
         Specialization::Int(val) if ty.is_subtype(types::CUInt32) => write!(f, "[{}]", val >> 32),
         Specialization::Int(val) if ty.is_subtype(types::CUInt64) => write!(f, "[{}]", val),
+        Specialization::Int(val) if ty.is_subtype(types::CPtr) => write!(f, "[{}]", Const::CPtr(val as *const u8).print(printer.ptr_map)),
         Specialization::Int(val) => write!(f, "[{val}]"),
         Specialization::Double(val) => write!(f, "[{val}]"),
     }
@@ -177,10 +178,50 @@ impl Type {
         }
     }
 
+    fn bits_from_exact_class(class: VALUE) -> Option<u64> {
+        types::ExactBitsAndClass
+            .iter()
+            .find(|&(_, class_object)| unsafe { **class_object } == class)
+            .map(|&(bits, _)| bits)
+    }
+
+    fn bits_from_subclass(class: VALUE) -> Option<u64> {
+        types::InexactBitsAndClass
+            .iter()
+            .find(|&(_, class_object)| class.is_subclass_of(unsafe { **class_object }) == ClassRelationship::Subclass)
+            // Can't be an immediate if it's a subclass.
+            .map(|&(bits, _)| bits & !bits::Immediate)
+    }
+
+    fn from_heap_object(val: VALUE) -> Type {
+        assert!(!val.special_const_p(), "val should be a heap object");
+        let bits =
+            // GC-hidden types
+            if is_array_exact(val) { bits::ArrayExact }
+            else if is_hash_exact(val) { bits::HashExact }
+            else if is_string_exact(val) { bits::StringExact }
+            // Singleton classes
+            else if is_module_exact(val) { bits::ModuleExact }
+            else if val.builtin_type() == RUBY_T_CLASS { bits::Class }
+            // Classes that have an immediate/heap split
+            else if val.class_of() == unsafe { rb_cInteger } { bits::Bignum }
+            else if val.class_of() == unsafe { rb_cFloat } { bits::HeapFloat }
+            else if val.class_of() == unsafe { rb_cSymbol } { bits::DynamicSymbol }
+            else if let Some(bits) = Self::bits_from_exact_class(val.class_of()) { bits }
+            else if let Some(bits) = Self::bits_from_subclass(val.class_of()) { bits }
+            else {
+                unreachable!("Class {} is not a subclass of BasicObject! Don't know what to do.",
+                             get_class_name(val.class_of()))
+            };
+        let spec = Specialization::Object(val);
+        Type { bits, spec }
+    }
+
     /// Create a `Type` from a Ruby `VALUE`. The type is not guaranteed to have object
     /// specialization in its `specialization` field (for example, `Qnil` will just be
     /// `types::NilClass`), but will be available via `ruby_object()`.
     pub fn from_value(val: VALUE) -> Type {
+        // Immediates
         if val.fixnum_p() {
             Type { bits: bits::Fixnum, spec: Specialization::Object(val) }
         }
@@ -199,45 +240,25 @@ impl Type {
             // valid on imemo.
             Type { bits: bits::CallableMethodEntry, spec: Specialization::Object(val) }
         }
-        else if val.class_of() == unsafe { rb_cInteger } {
-            Type { bits: bits::Bignum, spec: Specialization::Object(val) }
-        }
-        else if val.class_of() == unsafe { rb_cFloat } {
-            Type { bits: bits::HeapFloat, spec: Specialization::Object(val) }
-        }
-        else if val.class_of() == unsafe { rb_cSymbol } {
-            Type { bits: bits::DynamicSymbol, spec: Specialization::Object(val) }
-        }
-        else if is_array_exact(val) {
-            Type { bits: bits::ArrayExact, spec: Specialization::Object(val) }
-        }
-        else if is_hash_exact(val) {
-            Type { bits: bits::HashExact, spec: Specialization::Object(val) }
-        }
-        else if is_range_exact(val) {
-            Type { bits: bits::RangeExact, spec: Specialization::Object(val) }
-        }
-        else if is_string_exact(val) {
-            Type { bits: bits::StringExact, spec: Specialization::Object(val) }
-        }
-        else if is_module_exact(val) {
-            Type { bits: bits::ModuleExact, spec: Specialization::Object(val) }
-        }
-        else if val.builtin_type() == RUBY_T_CLASS {
-            Type { bits: bits::Class, spec: Specialization::Object(val) }
-        }
-        else if val.class_of() == unsafe { rb_cRegexp } {
-            Type { bits: bits::RegexpExact, spec: Specialization::Object(val) }
-        }
-        else if val.class_of() == unsafe { rb_cSet } {
-            Type { bits: bits::SetExact, spec: Specialization::Object(val) }
-        }
-        else if val.class_of() == unsafe { rb_cObject } {
-            Type { bits: bits::ObjectExact, spec: Specialization::Object(val) }
-        }
         else {
-            // TODO(max): Add more cases for inferring type bits from built-in types
-            Type { bits: bits::BasicObject, spec: Specialization::Object(val) }
+            Self::from_heap_object(val)
+        }
+    }
+
+    pub fn from_const(val: Const) -> Type {
+        match val {
+            Const::Value(v) => Self::from_value(v),
+            Const::CBool(v) => Self::from_cbool(v),
+            Const::CInt8(v) => Self::from_cint(types::CInt8, v as i64),
+            Const::CInt16(v) => Self::from_cint(types::CInt16, v as i64),
+            Const::CInt32(v) => Self::from_cint(types::CInt32, v as i64),
+            Const::CInt64(v) => Self::from_cint(types::CInt64, v as i64),
+            Const::CUInt8(v) => Self::from_cint(types::CUInt8, v as i64),
+            Const::CUInt16(v) => Self::from_cint(types::CUInt16, v as i64),
+            Const::CUInt32(v) => Self::from_cint(types::CUInt32, v as i64),
+            Const::CUInt64(v) => Self::from_cint(types::CUInt64, v as i64),
+            Const::CPtr(v) => Self::from_cptr(v),
+            Const::CDouble(v) => Self::from_double(v),
         }
     }
 
@@ -248,27 +269,18 @@ impl Type {
         else if val.is_nil() { types::NilClass }
         else if val.is_true() { types::TrueClass }
         else if val.is_false() { types::FalseClass }
-        else if val.class() == unsafe { rb_cString } { types::StringExact }
-        else if val.class() == unsafe { rb_cArray } { types::ArrayExact }
-        else if val.class() == unsafe { rb_cHash } { types::HashExact }
-        else {
-            // TODO(max): Add more cases for inferring type bits from built-in types
-            Type { bits: bits::HeapObject, spec: Specialization::TypeExact(val.class()) }
-        }
+        else { Self::from_class(val.class()) }
     }
 
     pub fn from_class(class: VALUE) -> Type {
-        if class == unsafe { rb_cArray } { types::ArrayExact }
-        else if class == unsafe { rb_cFalseClass } { types::FalseClass }
-        else if class == unsafe { rb_cHash } { types::HashExact }
-        else if class == unsafe { rb_cInteger } { types::Integer}
-        else if class == unsafe { rb_cNilClass } { types::NilClass }
-        else if class == unsafe { rb_cString } { types::StringExact }
-        else if class == unsafe { rb_cTrueClass } { types::TrueClass }
-        else {
-            // TODO(max): Add more cases for inferring type bits from built-in types
-            Type { bits: bits::HeapObject, spec: Specialization::TypeExact(class) }
+        if let Some(bits) = Self::bits_from_exact_class(class) {
+            return Type::from_bits(bits);
         }
+        if let Some(bits) = Self::bits_from_subclass(class) {
+            return Type { bits, spec: Specialization::TypeExact(class) }
+        }
+        unreachable!("Class {} is not a subclass of BasicObject! Don't know what to do.",
+                     get_class_name(class))
     }
 
     /// Private. Only for creating type globals.
@@ -292,6 +304,10 @@ impl Type {
                 ty.bits != types::CUnsigned.bits && ty.bits != types::CSigned.bits,
                 "ty must be a specific int size");
         Type { bits: ty.bits, spec: Specialization::Int(val as u64) }
+    }
+
+    pub fn from_cptr(val: *const u8) -> Type {
+        Type { bits: bits::CPtr, spec: Specialization::Int(val as u64) }
     }
 
     /// Create a `Type` (a `CDouble` with double specialization) from a f64.
@@ -361,21 +377,9 @@ impl Type {
     }
 
     fn is_builtin(class: VALUE) -> bool {
-        if class == unsafe { rb_cArray } { return true; }
-        if class == unsafe { rb_cClass } { return true; }
-        if class == unsafe { rb_cFalseClass } { return true; }
-        if class == unsafe { rb_cFloat } { return true; }
-        if class == unsafe { rb_cHash } { return true; }
-        if class == unsafe { rb_cInteger } { return true; }
-        if class == unsafe { rb_cModule } { return true; }
-        if class == unsafe { rb_cNilClass } { return true; }
-        if class == unsafe { rb_cObject } { return true; }
-        if class == unsafe { rb_cRange } { return true; }
-        if class == unsafe { rb_cRegexp } { return true; }
-        if class == unsafe { rb_cString } { return true; }
-        if class == unsafe { rb_cSymbol } { return true; }
-        if class == unsafe { rb_cTrueClass } { return true; }
-        false
+        types::ExactBitsAndClass
+            .iter()
+            .any(|&(_, class_object)| unsafe { *class_object } == class)
     }
 
     /// Union both types together, preserving specialization if possible.
@@ -471,22 +475,10 @@ impl Type {
         if let Some(val) = self.exact_ruby_class() {
             return Some(val);
         }
-        if self.is_subtype(types::ArrayExact) { return Some(unsafe { rb_cArray }); }
-        if self.is_subtype(types::Class) { return Some(unsafe { rb_cClass }); }
-        if self.is_subtype(types::FalseClass) { return Some(unsafe { rb_cFalseClass }); }
-        if self.is_subtype(types::Float) { return Some(unsafe { rb_cFloat }); }
-        if self.is_subtype(types::HashExact) { return Some(unsafe { rb_cHash }); }
-        if self.is_subtype(types::Integer) { return Some(unsafe { rb_cInteger }); }
-        if self.is_subtype(types::ModuleExact) { return Some(unsafe { rb_cModule }); }
-        if self.is_subtype(types::NilClass) { return Some(unsafe { rb_cNilClass }); }
-        if self.is_subtype(types::ObjectExact) { return Some(unsafe { rb_cObject }); }
-        if self.is_subtype(types::RangeExact) { return Some(unsafe { rb_cRange }); }
-        if self.is_subtype(types::RegexpExact) { return Some(unsafe { rb_cRegexp }); }
-        if self.is_subtype(types::SetExact) { return Some(unsafe { rb_cSet }); }
-        if self.is_subtype(types::StringExact) { return Some(unsafe { rb_cString }); }
-        if self.is_subtype(types::Symbol) { return Some(unsafe { rb_cSymbol }); }
-        if self.is_subtype(types::TrueClass) { return Some(unsafe { rb_cTrueClass }); }
-        None
+        types::ExactBitsAndClass
+            .iter()
+            .find(|&(bits, _)| self.is_subtype(Type::from_bits(*bits)))
+            .map(|&(_, class_object)| unsafe { *class_object })
     }
 
     /// Check bit equality of two `Type`s. Do not use! You are probably looking for [`Type::is_subtype`].
@@ -534,6 +526,11 @@ mod tests {
     use crate::cruby::rb_hash_new;
     use crate::cruby::rb_float_new;
     use crate::cruby::define_class;
+    use crate::cruby::rb_cObject;
+    use crate::cruby::rb_cSet;
+    use crate::cruby::rb_cTrueClass;
+    use crate::cruby::rb_cFalseClass;
+    use crate::cruby::rb_cNilClass;
 
     #[track_caller]
     fn assert_bit_equal(left: Type, right: Type) {
@@ -592,6 +589,17 @@ mod tests {
     }
 
     #[test]
+    fn numeric() {
+        assert_subtype(types::Integer, types::Numeric);
+        assert_subtype(types::Float, types::Numeric);
+        assert_subtype(types::Float.union(types::Integer), types::Numeric);
+        assert_bit_equal(types::Float
+            .union(types::Integer)
+            .union(types::NumericExact)
+            .union(types::NumericSubclass), types::Numeric);
+    }
+
+    #[test]
     fn symbol() {
         assert_subtype(types::StaticSymbol, types::Symbol);
         assert_subtype(types::DynamicSymbol, types::Symbol);
@@ -610,6 +618,32 @@ mod tests {
         assert_not_subtype(types::DynamicSymbol, types::Immediate);
         assert_subtype(types::Flonum, types::Immediate);
         assert_not_subtype(types::HeapFloat, types::Immediate);
+    }
+
+    #[test]
+    fn heap_basic_object() {
+        assert_not_subtype(Type::fixnum(123), types::HeapBasicObject);
+        assert_not_subtype(types::Fixnum, types::HeapBasicObject);
+        assert_subtype(types::Bignum, types::HeapBasicObject);
+        assert_not_subtype(types::Integer, types::HeapBasicObject);
+        assert_not_subtype(types::NilClass, types::HeapBasicObject);
+        assert_not_subtype(types::TrueClass, types::HeapBasicObject);
+        assert_not_subtype(types::FalseClass, types::HeapBasicObject);
+        assert_not_subtype(types::StaticSymbol, types::HeapBasicObject);
+        assert_subtype(types::DynamicSymbol, types::HeapBasicObject);
+        assert_not_subtype(types::Flonum, types::HeapBasicObject);
+        assert_subtype(types::HeapFloat, types::HeapBasicObject);
+        assert_not_subtype(types::BasicObject, types::HeapBasicObject);
+        assert_not_subtype(types::Object, types::HeapBasicObject);
+        assert_not_subtype(types::Immediate, types::HeapBasicObject);
+        assert_not_subtype(types::HeapBasicObject, types::Immediate);
+        crate::cruby::with_rubyvm(|| {
+            let left = Type::from_value(rust_str_to_ruby("hello"));
+            let right = Type::from_value(rust_str_to_ruby("world"));
+            assert_subtype(left, types::HeapBasicObject);
+            assert_subtype(right, types::HeapBasicObject);
+            assert_subtype(left.union(right), types::HeapBasicObject);
+        });
     }
 
     #[test]
@@ -841,6 +875,17 @@ mod tests {
             let ty = Type::from_value(cme_value);
             assert_subtype(ty, types::CallableMethodEntry);
             assert!(ty.ruby_object_known());
+        });
+    }
+
+    #[test]
+    fn string_subclass_is_string_subtype() {
+        crate::cruby::with_rubyvm(|| {
+            assert_subtype(types::StringExact, types::String);
+            assert_subtype(Type::from_class(unsafe { rb_cString }), types::String);
+            assert_subtype(Type::from_class(unsafe { rb_cString }), types::StringExact);
+            let c_class = define_class("C", unsafe { rb_cString });
+            assert_subtype(Type::from_class(c_class), types::String);
         });
     }
 

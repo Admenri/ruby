@@ -2427,7 +2427,7 @@ impl<'a> JITState<'a> {
         // SAFETY: allocated with Box above
         unsafe { ptr::write(blockref, block) };
 
-        // Block is initialized now. Note that MaybeUnint<T> has the same layout as T.
+        // Block is initialized now. Note that MaybeUninit<T> has the same layout as T.
         let blockref = NonNull::new(blockref as *mut Block).expect("no null from Box");
 
         // Track all the assumptions the block makes as invariants
@@ -3591,6 +3591,13 @@ fn branch_stub_hit_body(branch_ptr: *const c_void, target_idx: u32, ec: EcPtr) -
             return CodegenGlobals::get_stub_exit_code().raw_ptr(cb);
         }
 
+        // Bail if this branch is housed in an invalidated (dead) block.
+        // This only happens in rare invalidation scenarios and we need
+        // to avoid linking a dead block to a live block with a branch.
+        if branch.block.get().as_ref().iseq.get().is_null() {
+            return CodegenGlobals::get_stub_exit_code().raw_ptr(cb);
+        }
+
         (cfp, original_interp_sp)
     };
 
@@ -3790,7 +3797,7 @@ pub fn gen_branch_stub_hit_trampoline(ocb: &mut OutlinedCb) -> Option<CodePtr> {
     let mut asm = Assembler::new_without_iseq();
 
     // For `branch_stub_hit(branch_ptr, target_idx, ec)`,
-    // `branch_ptr` and `target_idx` is different for each stub,
+    // `branch_ptr` and `target_idx` are different for each stub,
     // but the call and what's after is the same. This trampoline
     // is the unchanging part.
     // Since this trampoline is static, it allows code GC inside
@@ -4297,11 +4304,9 @@ pub fn invalidate_block_version(blockref: &BlockRef) {
     incr_counter!(invalidation_count);
 }
 
-// We cannot deallocate blocks immediately after invalidation since there
-// could be stubs waiting to access branch pointers. Return stubs can do
-// this since patching the code for setting up return addresses does not
-// affect old return addresses that are already set up to use potentially
-// invalidated branch pointers. Example:
+// We cannot deallocate blocks immediately after invalidation since patching the code for setting
+// up return addresses does not affect outstanding return addresses that are on stack and will use
+// invalidated branch pointers when hit. Example:
 //   def foo(n)
 //     if n == 2
 //       # 1.times.each to create a cfunc frame to preserve the JIT frame
@@ -4309,13 +4314,16 @@ pub fn invalidate_block_version(blockref: &BlockRef) {
 //       return 1.times.each { Object.define_method(:foo) {} }
 //     end
 //
-//     foo(n + 1)
+//     foo(n + 1) # The block for this call houses the return branch stub
 //   end
 //   p foo(1)
 pub fn delayed_deallocation(blockref: BlockRef) {
     block_assumptions_free(blockref);
 
-    let payload = get_iseq_payload(unsafe { blockref.as_ref() }.iseq.get()).unwrap();
+    let block = unsafe { blockref.as_ref() };
+    // Set null ISEQ on the block to signal that it's dead.
+    let iseq = block.iseq.replace(ptr::null());
+    let payload = get_iseq_payload(iseq).unwrap();
     payload.dead_blocks.push(blockref);
 }
 

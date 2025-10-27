@@ -2622,10 +2622,11 @@ pm_break_node_create(pm_parser_t *parser, const pm_token_t *keyword, pm_argument
 // There are certain flags that we want to use internally but don't want to
 // expose because they are not relevant beyond parsing. Therefore we'll define
 // them here and not define them in config.yml/a header file.
-static const pm_node_flags_t PM_WRITE_NODE_FLAGS_IMPLICIT_ARRAY = 0x4;
-static const pm_node_flags_t PM_CALL_NODE_FLAGS_IMPLICIT_ARRAY = 0x40;
-static const pm_node_flags_t PM_CALL_NODE_FLAGS_COMPARISON = 0x80;
-static const pm_node_flags_t PM_CALL_NODE_FLAGS_INDEX = 0x100;
+static const pm_node_flags_t PM_WRITE_NODE_FLAGS_IMPLICIT_ARRAY = (1 << 2);
+
+static const pm_node_flags_t PM_CALL_NODE_FLAGS_IMPLICIT_ARRAY = ((PM_CALL_NODE_FLAGS_LAST - 1) << 1);
+static const pm_node_flags_t PM_CALL_NODE_FLAGS_COMPARISON = ((PM_CALL_NODE_FLAGS_LAST - 1) << 2);
+static const pm_node_flags_t PM_CALL_NODE_FLAGS_INDEX = ((PM_CALL_NODE_FLAGS_LAST - 1) << 3);
 
 /**
  * Allocate and initialize a new CallNode node. This sets everything to NULL or
@@ -5279,6 +5280,12 @@ pm_interpolated_string_node_append(pm_interpolated_string_node_t *node, pm_node_
 
     switch (PM_NODE_TYPE(part)) {
         case PM_STRING_NODE:
+            // If inner string is not frozen, it stops being a static literal. We should *not* clear other flags,
+            // because concatenating two frozen strings (`'foo' 'bar'`) is still frozen. This holds true for
+            // as long as this interpolation only consists of other string literals.
+            if (!PM_NODE_FLAG_P(part, PM_STRING_FLAGS_FROZEN)) {
+                pm_node_flag_unset((pm_node_t *) node, PM_NODE_FLAG_STATIC_LITERAL);
+            }
             part->flags = (pm_node_flags_t) ((part->flags | PM_NODE_FLAG_STATIC_LITERAL | PM_STRING_FLAGS_FROZEN) & ~PM_STRING_FLAGS_MUTABLE);
             break;
         case PM_INTERPOLATED_STRING_NODE:
@@ -8584,64 +8591,64 @@ parser_lex_magic_comment(pm_parser_t *parser, bool semantic_token_seen) {
 
 static const uint32_t context_terminators[] = {
     [PM_CONTEXT_NONE] = 0,
-    [PM_CONTEXT_BEGIN] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_BEGIN_ENSURE] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_BEGIN_ELSE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_BEGIN_RESCUE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_BLOCK_BRACES] = (1 << PM_TOKEN_BRACE_RIGHT),
-    [PM_CONTEXT_BLOCK_KEYWORDS] = (1 << PM_TOKEN_KEYWORD_END) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ENSURE),
-    [PM_CONTEXT_BLOCK_ENSURE] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_BLOCK_ELSE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_BLOCK_RESCUE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_CASE_WHEN] = (1 << PM_TOKEN_KEYWORD_WHEN) | (1 << PM_TOKEN_KEYWORD_END) | (1 << PM_TOKEN_KEYWORD_ELSE),
-    [PM_CONTEXT_CASE_IN] = (1 << PM_TOKEN_KEYWORD_IN) | (1 << PM_TOKEN_KEYWORD_END) | (1 << PM_TOKEN_KEYWORD_ELSE),
-    [PM_CONTEXT_CLASS] = (1 << PM_TOKEN_KEYWORD_END) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ENSURE),
-    [PM_CONTEXT_CLASS_ENSURE] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_CLASS_ELSE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_CLASS_RESCUE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_DEF] = (1 << PM_TOKEN_KEYWORD_END) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ENSURE),
-    [PM_CONTEXT_DEF_ENSURE] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_DEF_ELSE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_DEF_RESCUE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_DEF_PARAMS] = (1 << PM_TOKEN_EOF),
-    [PM_CONTEXT_DEFINED] = (1 << PM_TOKEN_EOF),
-    [PM_CONTEXT_DEFAULT_PARAMS] = (1 << PM_TOKEN_COMMA) | (1 << PM_TOKEN_PARENTHESIS_RIGHT),
-    [PM_CONTEXT_ELSE] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_ELSIF] = (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_ELSIF) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_EMBEXPR] = (1 << PM_TOKEN_EMBEXPR_END),
-    [PM_CONTEXT_FOR] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_FOR_INDEX] = (1 << PM_TOKEN_KEYWORD_IN),
-    [PM_CONTEXT_IF] = (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_ELSIF) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_LAMBDA_BRACES] = (1 << PM_TOKEN_BRACE_RIGHT),
-    [PM_CONTEXT_LAMBDA_DO_END] = (1 << PM_TOKEN_KEYWORD_END) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ENSURE),
-    [PM_CONTEXT_LAMBDA_ENSURE] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_LAMBDA_ELSE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_LAMBDA_RESCUE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_LOOP_PREDICATE] = (1 << PM_TOKEN_KEYWORD_DO) | (1 << PM_TOKEN_KEYWORD_THEN),
-    [PM_CONTEXT_MAIN] = (1 << PM_TOKEN_EOF),
-    [PM_CONTEXT_MODULE] = (1 << PM_TOKEN_KEYWORD_END) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ENSURE),
-    [PM_CONTEXT_MODULE_ENSURE] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_MODULE_ELSE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_MODULE_RESCUE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_MULTI_TARGET] = (1 << PM_TOKEN_EOF),
-    [PM_CONTEXT_PARENS] = (1 << PM_TOKEN_PARENTHESIS_RIGHT),
-    [PM_CONTEXT_POSTEXE] = (1 << PM_TOKEN_BRACE_RIGHT),
-    [PM_CONTEXT_PREDICATE] = (1 << PM_TOKEN_KEYWORD_THEN) | (1 << PM_TOKEN_NEWLINE) | (1 << PM_TOKEN_SEMICOLON),
-    [PM_CONTEXT_PREEXE] = (1 << PM_TOKEN_BRACE_RIGHT),
-    [PM_CONTEXT_RESCUE_MODIFIER] = (1 << PM_TOKEN_EOF),
-    [PM_CONTEXT_SCLASS] = (1 << PM_TOKEN_KEYWORD_END) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ENSURE),
-    [PM_CONTEXT_SCLASS_ENSURE] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_SCLASS_ELSE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_SCLASS_RESCUE] = (1 << PM_TOKEN_KEYWORD_ENSURE) | (1 << PM_TOKEN_KEYWORD_RESCUE) | (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_TERNARY] = (1 << PM_TOKEN_EOF),
-    [PM_CONTEXT_UNLESS] = (1 << PM_TOKEN_KEYWORD_ELSE) | (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_UNTIL] = (1 << PM_TOKEN_KEYWORD_END),
-    [PM_CONTEXT_WHILE] = (1 << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_BEGIN] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_BEGIN_ENSURE] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_BEGIN_ELSE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_BEGIN_RESCUE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_BLOCK_BRACES] = (1U << PM_TOKEN_BRACE_RIGHT),
+    [PM_CONTEXT_BLOCK_KEYWORDS] = (1U << PM_TOKEN_KEYWORD_END) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ENSURE),
+    [PM_CONTEXT_BLOCK_ENSURE] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_BLOCK_ELSE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_BLOCK_RESCUE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_CASE_WHEN] = (1U << PM_TOKEN_KEYWORD_WHEN) | (1U << PM_TOKEN_KEYWORD_END) | (1U << PM_TOKEN_KEYWORD_ELSE),
+    [PM_CONTEXT_CASE_IN] = (1U << PM_TOKEN_KEYWORD_IN) | (1U << PM_TOKEN_KEYWORD_END) | (1U << PM_TOKEN_KEYWORD_ELSE),
+    [PM_CONTEXT_CLASS] = (1U << PM_TOKEN_KEYWORD_END) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ENSURE),
+    [PM_CONTEXT_CLASS_ENSURE] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_CLASS_ELSE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_CLASS_RESCUE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_DEF] = (1U << PM_TOKEN_KEYWORD_END) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ENSURE),
+    [PM_CONTEXT_DEF_ENSURE] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_DEF_ELSE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_DEF_RESCUE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_DEF_PARAMS] = (1U << PM_TOKEN_EOF),
+    [PM_CONTEXT_DEFINED] = (1U << PM_TOKEN_EOF),
+    [PM_CONTEXT_DEFAULT_PARAMS] = (1U << PM_TOKEN_COMMA) | (1U << PM_TOKEN_PARENTHESIS_RIGHT),
+    [PM_CONTEXT_ELSE] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_ELSIF] = (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_ELSIF) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_EMBEXPR] = (1U << PM_TOKEN_EMBEXPR_END),
+    [PM_CONTEXT_FOR] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_FOR_INDEX] = (1U << PM_TOKEN_KEYWORD_IN),
+    [PM_CONTEXT_IF] = (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_ELSIF) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_LAMBDA_BRACES] = (1U << PM_TOKEN_BRACE_RIGHT),
+    [PM_CONTEXT_LAMBDA_DO_END] = (1U << PM_TOKEN_KEYWORD_END) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ENSURE),
+    [PM_CONTEXT_LAMBDA_ENSURE] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_LAMBDA_ELSE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_LAMBDA_RESCUE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_LOOP_PREDICATE] = (1U << PM_TOKEN_KEYWORD_DO) | (1U << PM_TOKEN_KEYWORD_THEN),
+    [PM_CONTEXT_MAIN] = (1U << PM_TOKEN_EOF),
+    [PM_CONTEXT_MODULE] = (1U << PM_TOKEN_KEYWORD_END) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ENSURE),
+    [PM_CONTEXT_MODULE_ENSURE] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_MODULE_ELSE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_MODULE_RESCUE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_MULTI_TARGET] = (1U << PM_TOKEN_EOF),
+    [PM_CONTEXT_PARENS] = (1U << PM_TOKEN_PARENTHESIS_RIGHT),
+    [PM_CONTEXT_POSTEXE] = (1U << PM_TOKEN_BRACE_RIGHT),
+    [PM_CONTEXT_PREDICATE] = (1U << PM_TOKEN_KEYWORD_THEN) | (1U << PM_TOKEN_NEWLINE) | (1U << PM_TOKEN_SEMICOLON),
+    [PM_CONTEXT_PREEXE] = (1U << PM_TOKEN_BRACE_RIGHT),
+    [PM_CONTEXT_RESCUE_MODIFIER] = (1U << PM_TOKEN_EOF),
+    [PM_CONTEXT_SCLASS] = (1U << PM_TOKEN_KEYWORD_END) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ENSURE),
+    [PM_CONTEXT_SCLASS_ENSURE] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_SCLASS_ELSE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_SCLASS_RESCUE] = (1U << PM_TOKEN_KEYWORD_ENSURE) | (1U << PM_TOKEN_KEYWORD_RESCUE) | (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_TERNARY] = (1U << PM_TOKEN_EOF),
+    [PM_CONTEXT_UNLESS] = (1U << PM_TOKEN_KEYWORD_ELSE) | (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_UNTIL] = (1U << PM_TOKEN_KEYWORD_END),
+    [PM_CONTEXT_WHILE] = (1U << PM_TOKEN_KEYWORD_END),
 };
 
 static inline bool
 context_terminator(pm_context_t context, pm_token_t *token) {
-    return token->type < 32 && (context_terminators[context] & (1 << token->type));
+    return token->type < 32 && (context_terminators[context] & (1U << token->type));
 }
 
 /**
@@ -14606,6 +14613,18 @@ update_parameter_state(pm_parser_t *parser, pm_token_t *token, pm_parameters_ord
 }
 
 /**
+ * Ensures that after parsing a parameter, the next token is not `=`.
+ * Some parameters like `def(* = 1)` cannot become optional. When no parens
+ * are present like in `def * = 1`, this creates ambiguity with endless method definitions.
+ */
+static inline void
+refute_optional_parameter(pm_parser_t *parser) {
+    if (match1(parser, PM_TOKEN_EQUAL)) {
+        pm_parser_err_previous(parser, PM_ERR_DEF_ENDLESS_PARAMETERS);
+    }
+}
+
+/**
  * Parse a list of parameters on a method definition.
  */
 static pm_parameters_node_t *
@@ -14657,6 +14676,10 @@ parse_parameters(
                     parser->current_scope->parameters |= PM_SCOPE_PARAMETERS_FORWARDING_BLOCK;
                 }
 
+                if (!uses_parentheses) {
+                    refute_optional_parameter(parser);
+                }
+
                 pm_block_parameter_node_t *param = pm_block_parameter_node_create(parser, &name, &operator);
                 if (repeated) {
                     pm_node_flag_set_repeated_parameter((pm_node_t *)param);
@@ -14677,6 +14700,10 @@ parse_parameters(
 
                 bool succeeded = update_parameter_state(parser, &parser->current, &order);
                 parser_lex(parser);
+
+                if (!uses_parentheses) {
+                    refute_optional_parameter(parser);
+                }
 
                 parser->current_scope->parameters |= PM_SCOPE_PARAMETERS_FORWARDING_ALL;
                 pm_forwarding_parameter_node_t *param = pm_forwarding_parameter_node_create(parser, &parser->previous);
@@ -14859,6 +14886,10 @@ parse_parameters(
                         context_pop(parser);
                         pm_parameters_node_keywords_append(params, param);
 
+                        if (!uses_parentheses) {
+                            refute_optional_parameter(parser);
+                        }
+
                         // If parsing the value of the parameter resulted in error recovery,
                         // then we can put a missing node in its place and stop parsing the
                         // parameters entirely now.
@@ -14888,6 +14919,10 @@ parse_parameters(
                 } else {
                     name = not_provided(parser);
                     parser->current_scope->parameters |= PM_SCOPE_PARAMETERS_FORWARDING_POSITIONALS;
+                }
+
+                if (!uses_parentheses) {
+                    refute_optional_parameter(parser);
                 }
 
                 pm_node_t *param = (pm_node_t *) pm_rest_parameter_node_create(parser, &operator, &name);
@@ -14936,6 +14971,10 @@ parse_parameters(
                     if (repeated) {
                         pm_node_flag_set_repeated_parameter(param);
                     }
+                }
+
+                if (!uses_parentheses) {
+                    refute_optional_parameter(parser);
                 }
 
                 if (params->keyword_rest == NULL) {
@@ -15725,7 +15764,7 @@ parse_return(pm_parser_t *parser, pm_node_t *node) {
                 break;
         }
     }
-    if (in_sclass) {
+    if (in_sclass && parser->version >= PM_OPTIONS_VERSION_CRUBY_3_4) {
         pm_parser_err_node(parser, node, PM_ERR_RETURN_INVALID);
     }
 }
@@ -22517,8 +22556,9 @@ parse_program(pm_parser_t *parser) {
         statements = wrap_statements(parser, statements);
     } else {
         flush_block_exits(parser, previous_block_exits);
-        pm_node_list_free(&current_block_exits);
     }
+
+    pm_node_list_free(&current_block_exits);
 
     // If this is an empty file, then we're still going to parse all of the
     // statements in order to gather up all of the comments and such. Here we'll

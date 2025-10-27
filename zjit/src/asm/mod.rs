@@ -20,7 +20,6 @@ pub mod arm64;
 pub struct Label(pub usize);
 
 /// Reference to an ASM label
-#[derive(Clone)]
 pub struct LabelRef {
     // Position in the code block where the label reference exists
     pos: usize,
@@ -34,7 +33,7 @@ pub struct LabelRef {
     num_bytes: usize,
 
     /// The object that knows how to encode the branch instruction.
-    encode: fn(&mut CodeBlock, i64, i64)
+    encode: Box<dyn Fn(&mut CodeBlock, i64, i64)>,
 }
 
 /// Block of memory into which instructions can be assembled
@@ -223,11 +222,11 @@ impl CodeBlock {
     }
 
     // Add a label reference at the current write position
-    pub fn label_ref(&mut self, label: Label, num_bytes: usize, encode: fn(&mut CodeBlock, i64, i64)) {
+    pub fn label_ref(&mut self, label: Label, num_bytes: usize, encode: impl Fn(&mut CodeBlock, i64, i64) + 'static) {
         assert!(label.0 < self.label_addrs.len());
 
         // Keep track of the reference
-        self.label_refs.push(LabelRef { pos: self.write_pos, label, num_bytes, encode });
+        self.label_refs.push(LabelRef { pos: self.write_pos, label, num_bytes, encode: Box::new(encode) });
 
         // Move past however many bytes the instruction takes up
         if self.write_pos + num_bytes < self.mem_size {
@@ -251,7 +250,7 @@ impl CodeBlock {
             assert!(label_addr < self.mem_size);
 
             self.write_pos = ref_pos;
-            (label_ref.encode)(self, (ref_pos + label_ref.num_bytes) as i64, label_addr as i64);
+            (label_ref.encode.as_ref())(self, (ref_pos + label_ref.num_bytes) as i64, label_addr as i64);
 
             // Assert that we've written the same number of bytes that we
             // expected to have written.
@@ -284,14 +283,11 @@ impl CodeBlock {
 
     /// Call a func with the disasm of generated code for testing
     #[allow(unused_variables)]
-    #[cfg(test)]
-    pub fn with_disasm<T>(&self, func: T) where T: Fn(String) {
-        #[cfg(feature = "disasm")]
-        {
-            let start_addr = self.get_ptr(0).raw_addr(self);
-            let end_addr = self.get_write_ptr().raw_addr(self);
-            func(crate::disasm::disasm_addr_range(self, start_addr, end_addr));
-        }
+    #[cfg(all(test, feature = "disasm"))]
+    pub fn disasm(&self) -> String {
+        let start_addr = self.get_ptr(0).raw_addr(self);
+        let end_addr = self.get_write_ptr().raw_addr(self);
+        crate::disasm::disasm_addr_range(self, start_addr, end_addr)
     }
 
     /// Return the hex dump of generated code for testing
@@ -299,6 +295,46 @@ impl CodeBlock {
     pub fn hexdump(&self) -> String {
         format!("{:x}", self)
     }
+}
+
+/// Run assert_snapshot! only if cfg!(feature = "disasm").
+/// $actual can be not only `cb.disasm()` but also `disasms!(cb1, cb2, ...)`.
+#[cfg(test)]
+#[macro_export]
+macro_rules! assert_disasm_snapshot {
+    ($actual: expr, @$($tt: tt)*) => {{
+        #[cfg(feature = "disasm")]
+        assert_snapshot!($actual, @$($tt)*)
+    }};
+}
+
+/// Combine multiple cb.disasm() results to match all of them at once, which allows
+/// us to avoid running the set of zjit-test -> zjit-test-update multiple times.
+#[cfg(all(test, feature = "disasm"))]
+#[macro_export]
+macro_rules! disasms {
+    ($( $cb:expr ),+ $(,)?) => {{
+        crate::disasms_with!("", $( $cb ),+)
+    }};
+}
+
+/// Basically `disasms!` but allows a non-"" delimiter, such as "\n"
+#[cfg(all(test, feature = "disasm"))]
+#[macro_export]
+macro_rules! disasms_with {
+    ($join:expr, $( $cb:expr ),+ $(,)?) => {{
+        vec![$( $cb.disasm() ),+].join($join)
+    }};
+}
+
+/// Combine multiple cb.hexdump() results to match all of them at once, which allows
+/// us to avoid running the set of zjit-test -> zjit-test-update multiple times.
+#[cfg(test)]
+#[macro_export]
+macro_rules! hexdumps {
+    ($( $cb:expr ),+ $(,)?) => {{
+        vec![$( $cb.hexdump() ),+].join("\n")
+    }};
 }
 
 /// Produce hex string output from the bytes in a code block

@@ -19,6 +19,7 @@
 #include "internal/vm.h"
 #include "probes.h"
 #include "ruby/encoding.h"
+#include "ruby/ractor.h"
 #include "ruby/st.h"
 #include "symbol.h"
 #include "vm_sync.h"
@@ -200,7 +201,6 @@ dup_string_for_create(VALUE str)
     OBJ_FREEZE(str);
 
     str = rb_fstring(str);
-
     return str;
 }
 
@@ -255,8 +255,8 @@ sym_set_create(VALUE sym, void *data)
 
         rb_encoding *enc = rb_enc_get(str);
         rb_enc_set_index((VALUE)obj, rb_enc_to_index(enc));
-        OBJ_FREEZE((VALUE)obj);
         RB_OBJ_WRITE((VALUE)obj, &obj->fstr, str);
+        RB_OBJ_SET_FROZEN_SHAREABLE((VALUE)obj);
 
         int id = rb_str_symname_type(str, IDSET_ATTRSET_FOR_INTERN);
         if (id < 0) id = ID_INTERNAL;
@@ -845,7 +845,7 @@ lookup_id_str(ID id)
 ID
 rb_intern3(const char *name, long len, rb_encoding *enc)
 {
-    struct RString fake_str;
+    struct RString fake_str = {RBASIC_INIT};
     VALUE str = rb_setup_fake_str(&fake_str, name, len, enc);
     OBJ_FREEZE(str);
 
@@ -1222,7 +1222,7 @@ rb_check_symbol(volatile VALUE *namep)
 ID
 rb_check_id_cstr(const char *ptr, long len, rb_encoding *enc)
 {
-    struct RString fake_str;
+    struct RString fake_str = {RBASIC_INIT};
     const VALUE name = rb_setup_fake_str(&fake_str, ptr, len, enc);
 
     sym_check_asciionly(name, true);
@@ -1234,7 +1234,7 @@ VALUE
 rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc)
 {
     VALUE sym;
-    struct RString fake_str;
+    struct RString fake_str = {RBASIC_INIT};
     const VALUE name = rb_setup_fake_str(&fake_str, ptr, len, enc);
 
     sym_check_asciionly(name, true);
@@ -1258,7 +1258,7 @@ FUNC_MINIMIZED(VALUE rb_sym_intern_ascii_cstr(const char *ptr));
 VALUE
 rb_sym_intern(const char *ptr, long len, rb_encoding *enc)
 {
-    struct RString fake_str;
+    struct RString fake_str = {RBASIC_INIT};
     const VALUE name = rb_setup_fake_str(&fake_str, ptr, len, enc);
     return rb_str_intern(name);
 }

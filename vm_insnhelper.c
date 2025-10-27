@@ -761,6 +761,25 @@ check_method_entry(VALUE obj, int can_be_svar)
     }
 }
 
+static rb_callable_method_entry_t *
+env_method_entry_unchecked(VALUE obj, int can_be_svar)
+{
+    if (obj == Qfalse) return NULL;
+
+    switch (imemo_type(obj)) {
+      case imemo_ment:
+        return (rb_callable_method_entry_t *)obj;
+      case imemo_cref:
+        return NULL;
+      case imemo_svar:
+        if (can_be_svar) {
+            return env_method_entry_unchecked(((struct vm_svar *)obj)->cref_or_me, FALSE);
+        }
+      default:
+        return NULL;
+    }
+}
+
 const rb_callable_method_entry_t *
 rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
 {
@@ -773,6 +792,20 @@ rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
     }
 
     return check_method_entry(ep[VM_ENV_DATA_INDEX_ME_CREF], TRUE);
+}
+
+const rb_callable_method_entry_t *
+rb_vm_frame_method_entry_unchecked(const rb_control_frame_t *cfp)
+{
+    const VALUE *ep = cfp->ep;
+    rb_callable_method_entry_t *me;
+
+    while (!VM_ENV_LOCAL_P_UNCHECKED(ep)) {
+        if ((me = env_method_entry_unchecked(ep[VM_ENV_DATA_INDEX_ME_CREF], FALSE)) != NULL) return me;
+        ep = VM_ENV_PREV_EP_UNCHECKED(ep);
+    }
+
+    return env_method_entry_unchecked(ep[VM_ENV_DATA_INDEX_ME_CREF], TRUE);
 }
 
 static const rb_iseq_t *
@@ -2087,8 +2120,9 @@ vm_evict_cc(VALUE klass, VALUE cc_tbl, ID mid)
             return;
         }
 
-        struct rb_class_cc_entries *ccs = NULL;
-        rb_managed_id_table_lookup(cc_tbl, mid, (VALUE *)&ccs);
+        VALUE ccs_obj = 0;
+        rb_managed_id_table_lookup(cc_tbl, mid, &ccs_obj);
+        struct rb_class_cc_entries *ccs = (struct rb_class_cc_entries *)ccs_obj;
 
         if (!ccs || !METHOD_ENTRY_INVALIDATED(ccs->cme)) {
             // Another ractor replaced that entry while we were waiting on the VM lock.
@@ -2149,7 +2183,11 @@ vm_populate_cc(VALUE klass, const struct rb_callinfo * const ci, ID mid)
     if (ccs == NULL) {
         VM_ASSERT(cc_tbl);
 
-        if (!LIKELY(rb_managed_id_table_lookup(cc_tbl, mid, (VALUE *)&ccs))) {
+        VALUE ccs_obj;
+        if (UNLIKELY(rb_managed_id_table_lookup(cc_tbl, mid, &ccs_obj))) {
+            ccs = (struct rb_class_cc_entries *)ccs_obj;
+        }
+        else {
             // TODO: required?
             ccs = vm_ccs_create(klass, cc_tbl, mid, cme);
         }
@@ -2184,7 +2222,9 @@ retry:
         // CCS data is keyed on method id, so we don't need the method id
         // for doing comparisons in the `for` loop below.
 
-        if (rb_managed_id_table_lookup(cc_tbl, mid, (VALUE *)&ccs)) {
+        VALUE ccs_obj;
+        if (rb_managed_id_table_lookup(cc_tbl, mid, &ccs_obj)) {
+            ccs = (struct rb_class_cc_entries *)ccs_obj;
             const int ccs_len = ccs->len;
 
             if (UNLIKELY(METHOD_ENTRY_INVALIDATED(ccs->cme))) {
@@ -5205,20 +5245,6 @@ block_proc_is_lambda(const VALUE procval)
     }
 }
 
-static inline const rb_namespace_t *
-block_proc_namespace(const VALUE procval)
-{
-    rb_proc_t *proc;
-
-    if (procval) {
-        GetProcPtr(procval, proc);
-        return proc->ns;
-    }
-    else {
-        return NULL;
-    }
-}
-
 static VALUE
 vm_yield_with_cfunc(rb_execution_context_t *ec,
                     const struct rb_captured_block *captured,
@@ -5374,10 +5400,6 @@ vm_invoke_iseq_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
 
     SET_SP(rsp);
 
-    if (calling->proc_ns) {
-        frame_flag |= VM_FRAME_FLAG_NS_SWITCH;
-    }
-
     vm_push_frame(ec, iseq,
                   frame_flag,
                   captured->self,
@@ -5478,9 +5500,6 @@ vm_invoke_proc_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
 {
     while (vm_block_handler_type(block_handler) == block_handler_type_proc) {
         VALUE proc = VM_BH_TO_PROC(block_handler);
-        if (!calling->proc_ns) {
-            calling->proc_ns = block_proc_namespace(proc);
-        }
         is_lambda = block_proc_is_lambda(proc);
         block_handler = vm_proc_to_block_handler(proc);
     }
@@ -6409,7 +6428,7 @@ static VALUE
 vm_opt_newarray_include_p(rb_execution_context_t *ec, rb_num_t num, const VALUE *ptr, VALUE target)
 {
     if (BASIC_OP_UNREDEFINED_P(BOP_INCLUDE_P, ARRAY_REDEFINED_OP_FLAG)) {
-        struct RArray fake_ary;
+        struct RArray fake_ary = {RBASIC_INIT};
         VALUE ary = rb_setup_fake_ary(&fake_ary, ptr, num);
         return rb_ary_includes(ary, target);
     }
@@ -6429,7 +6448,7 @@ static VALUE
 vm_opt_newarray_pack_buffer(rb_execution_context_t *ec, rb_num_t num, const VALUE *ptr, VALUE fmt, VALUE buffer)
 {
     if (BASIC_OP_UNREDEFINED_P(BOP_PACK, ARRAY_REDEFINED_OP_FLAG)) {
-        struct RArray fake_ary;
+        struct RArray fake_ary = {RBASIC_INIT};
         VALUE ary = rb_setup_fake_ary(&fake_ary, ptr, num);
         return rb_ec_pack_ary(ec, ary, fmt, (UNDEF_P(buffer) ? Qnil : buffer));
     }
@@ -6549,12 +6568,15 @@ vm_ic_update(const rb_iseq_t *iseq, IC ic, VALUE val, const VALUE *reg_ep, const
         return;
     }
 
-    struct iseq_inline_constant_cache_entry *ice = IMEMO_NEW(struct iseq_inline_constant_cache_entry, imemo_constcache, 0);
+    struct iseq_inline_constant_cache_entry *ice = SHAREABLE_IMEMO_NEW(struct iseq_inline_constant_cache_entry, imemo_constcache, 0);
     RB_OBJ_WRITE(ice, &ice->value, val);
     ice->ic_cref = vm_get_const_key_cref(reg_ep);
-    if (rb_ractor_shareable_p(val)) ice->flags |= IMEMO_CONST_CACHE_SHAREABLE;
-    RB_OBJ_WRITE(iseq, &ic->entry, ice);
 
+    if (rb_ractor_shareable_p(val)) {
+        RUBY_ASSERT((rb_gc_verify_shareable(val), 1));
+        ice->flags |= IMEMO_CONST_CACHE_SHAREABLE;
+    }
+    RB_OBJ_WRITE(iseq, &ic->entry, ice);
     RUBY_ASSERT(pc >= ISEQ_BODY(iseq)->iseq_encoded);
     unsigned pos = (unsigned)(pc - ISEQ_BODY(iseq)->iseq_encoded);
     rb_yjit_constant_ic_update(iseq, ic, pos);
@@ -6566,6 +6588,7 @@ rb_vm_opt_getconstant_path(rb_execution_context_t *ec, rb_control_frame_t *const
     VALUE val;
     const ID *segments = ic->segments;
     struct iseq_inline_constant_cache_entry *ice = ic->entry;
+
     if (ice && vm_ic_hit_p(ice, GET_EP())) {
         val = ice->value;
 
@@ -6596,7 +6619,14 @@ vm_once_dispatch(rb_execution_context_t *ec, ISEQ iseq, ISE is)
         VALUE val;
         is->once.running_thread = th;
         val = rb_ensure(vm_once_exec, (VALUE)iseq, vm_once_clear, (VALUE)is);
+        // TODO: confirm that it is shareable
+
+        if (RB_FL_ABLE(val)) {
+            RB_OBJ_SET_SHAREABLE(val);
+        }
+
         RB_OBJ_WRITE(ec->cfp->iseq, &is->once.value, val);
+
         /* is->once.running_thread is cleared by vm_once_clear() */
         is->once.running_thread = RUNNING_THREAD_ONCE_DONE; /* success */
         return val;

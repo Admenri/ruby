@@ -43,7 +43,7 @@ module SyncDefaultGems
     prism: ["ruby/prism", "main"],
     psych: 'ruby/psych',
     resolv: "ruby/resolv",
-    rubygems: 'rubygems/rubygems',
+    rubygems: 'ruby/rubygems',
     securerandom: "ruby/securerandom",
     shellwords: "ruby/shellwords",
     singleton: "ruby/singleton",
@@ -64,6 +64,10 @@ module SyncDefaultGems
 
   CLASSICAL_DEFAULT_BRANCH = "master"
 
+  # Allow synchronizing commits up to this FETCH_DEPTH. We've historically merged PRs
+  # with about 250 commits to ruby/ruby, so we use this depth for ruby/ruby in general.
+  FETCH_DEPTH = 500
+
   class << REPOSITORIES
     def [](gem)
       repo, branch = super(gem)
@@ -81,6 +85,10 @@ module SyncDefaultGems
     IO.popen(args) do |f|
       f.readlines(rs, chomp: chomp)
     end
+  end
+
+  def porcelain_status(*pattern)
+    pipe_readlines(%W"git status --porcelain -z --" + pattern)
   end
 
   def replace_rdoc_ref(file)
@@ -101,7 +109,7 @@ module SyncDefaultGems
   end
 
   def replace_rdoc_ref_all
-    result = pipe_readlines(%W"git status --porcelain -z -- *.c *.rb *.rdoc")
+    result = porcelain_status("*.c", "*.rb", "*.rdoc")
     result.map! {|line| line[/\A.M (.*)/, 1]}
     result.compact!
     return if result.empty?
@@ -489,14 +497,16 @@ module SyncDefaultGems
 
   def resolve_conflicts(gem, sha, edit)
     # Skip this commit if everything has been removed as `ignored_paths`.
-    changes = pipe_readlines(%W"git status --porcelain -z")
+    changes = porcelain_status()
     if changes.empty?
       puts "Skip empty commit #{sha}"
       return false
     end
 
-    # We want to skip DD: deleted by both.
-    deleted = changes.grep(/^DD /) {$'}
+    # We want to skip
+    # DD: deleted by both
+    # DU: deleted by us
+    deleted = changes.grep(/^D[DU] /) {$'}
     system(*%W"git rm -f --", *deleted) unless deleted.empty?
 
     # Import UA: added by them
@@ -505,10 +515,9 @@ module SyncDefaultGems
 
     # Discover unmerged files
     # AU: unmerged, added by us
-    # DU: unmerged, deleted by us
     # UU: unmerged, both modified
     # AA: unmerged, both added
-    conflict = changes.grep(/\A(?:.U|AA) /) {$'}
+    conflict = changes.grep(/\A(?:A[AU]|UU) /) {$'}
     # If -e option is given, open each conflicted file with an editor
     unless conflict.empty?
       if edit
@@ -624,6 +633,9 @@ module SyncDefaultGems
     # Commit cherry-picked commit
     if picked
       system(*%w"git commit --amend --no-edit")
+    elsif porcelain_status().empty?
+      system(*%w"git cherry-pick --skip")
+      return false
     else
       system(*%w"git cherry-pick --continue --no-edit")
     end or return nil
@@ -654,7 +666,7 @@ module SyncDefaultGems
         `git remote add #{gem} https://github.com/#{repo}.git`
       end
     end
-    system(*%W"git fetch --no-tags #{gem}")
+    system(*%W"git fetch --no-tags --depth=#{FETCH_DEPTH} #{gem} #{default_branch}")
 
     commits = commits_in_ranges(gem, repo, default_branch, ranges)
 

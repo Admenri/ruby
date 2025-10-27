@@ -196,6 +196,15 @@ class TC_IPAddr < Test::Unit::TestCase
     }
     assert_equal("::192.168.1.2", b.to_s)
     assert_equal(Socket::AF_INET6, b.family)
+    assert_equal(128, b.prefix)
+
+    a = IPAddr.new("192.168.0.0/16")
+    assert_warning(/obsolete/) {
+      b = a.ipv4_compat
+    }
+    assert_equal("::192.168.0.0", b.to_s)
+    assert_equal(Socket::AF_INET6, b.family)
+    assert_equal(112, b.prefix)
   end
 
   def test_ipv4_mapped
@@ -610,5 +619,17 @@ class TC_Operator < Test::Unit::TestCase
     assert_equal(true, s.include?(a4))
     assert_equal(true, s.include?(a5))
     assert_equal(true, s.include?(a6))
+  end
+
+  def test_raises_invalid_address_error_with_error_message
+    e = assert_raise(IPAddr::InvalidAddressError) do
+      IPAddr.new('192.168.0.1000')
+    end
+    assert_equal('invalid address: 192.168.0.1000', e.message)
+
+    e = assert_raise(IPAddr::InvalidAddressError) do
+      IPAddr.new('192.168.01.100')
+    end
+    assert_equal('zero-filled number in IPv4 address is ambiguous: 192.168.01.100', e.message)
   end
 end

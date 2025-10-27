@@ -982,7 +982,7 @@ RSpec.describe "the lockfile format" do
     update_repo2 do
       # Capistrano did this (at least until version 2.5.10)
       # RubyGems 2.2 doesn't allow the specifying of a dependency twice
-      # See https://github.com/rubygems/rubygems/commit/03dbac93a3396a80db258d9bc63500333c25bd2f
+      # See https://github.com/ruby/rubygems/commit/03dbac93a3396a80db258d9bc63500333c25bd2f
       build_gem "double_deps", "1.0", skip_validation: true do |s|
         s.add_dependency "net-ssh", ">= 1.0.0"
         s.add_dependency "net-ssh"
@@ -2105,6 +2105,74 @@ RSpec.describe "the lockfile format" do
 
       DEPENDENCIES
         net-smtp
+
+      BUNDLED WITH
+         #{Bundler::VERSION}
+    L
+  end
+
+  it "successfully updates the lockfile when a new gem is added in the Gemfile includes a gem that shouldn't be included" do
+    build_repo4 do
+      build_gem "logger", "1.7.0"
+      build_gem "rack", "3.2.0"
+      build_gem "net-smtp", "0.5.0"
+    end
+
+    gemfile <<~G
+      source "#{file_uri_for(gem_repo4)}"
+      gem "logger"
+      gem "net-smtp"
+
+      install_if -> { false } do
+        gem 'rack', github: 'rack/rack'
+      end
+    G
+
+    lockfile <<~L
+      GIT
+        remote: https://github.com/rack/rack.git
+        revision: 2fface9ac09fc582a81386becd939c987ad33f99
+        specs:
+          rack (3.2.0)
+
+      GEM
+        remote: #{file_uri_for(gem_repo4)}/
+        specs:
+          logger (1.7.0)
+
+      PLATFORMS
+        #{lockfile_platforms}
+
+      DEPENDENCIES
+        logger
+        rack!
+
+      BUNDLED WITH
+         #{Bundler::VERSION}
+    L
+
+    bundle "install"
+
+    expect(lockfile).to eq <<~L
+      GIT
+        remote: https://github.com/rack/rack.git
+        revision: 2fface9ac09fc582a81386becd939c987ad33f99
+        specs:
+          rack (3.2.0)
+
+      GEM
+        remote: #{file_uri_for(gem_repo4)}/
+        specs:
+          logger (1.7.0)
+          net-smtp (0.5.0)
+
+      PLATFORMS
+        #{lockfile_platforms}
+
+      DEPENDENCIES
+        logger
+        net-smtp
+        rack!
 
       BUNDLED WITH
          #{Bundler::VERSION}

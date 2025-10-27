@@ -113,8 +113,8 @@ fn emit_jmp_ptr(cb: &mut CodeBlock, dst_ptr: CodePtr, padding: bool) {
         b(cb, InstructionOffset::from_bytes((dst_addr - src_addr) as i32));
         1
     } else {
-        let num_insns = emit_load_value(cb, Assembler::SCRATCH0, dst_addr as u64);
-        br(cb, Assembler::SCRATCH0);
+        let num_insns = emit_load_value(cb, Assembler::EMIT0_OPND, dst_addr as u64);
+        br(cb, Assembler::EMIT0_OPND);
         num_insns + 1
     };
 
@@ -181,7 +181,7 @@ fn emit_load_value(cb: &mut CodeBlock, rd: A64Opnd, value: u64) -> usize {
 
 /// List of registers that can be used for register allocation.
 /// This has the same number of registers for x86_64 and arm64.
-/// SCRATCH0 and SCRATCH1 are excluded.
+/// SCRATCH_OPND, EMIT0_OPND, and EMIT1_OPND are excluded.
 pub const ALLOC_REGS: &[Reg] = &[
     X0_REG,
     X1_REG,
@@ -193,17 +193,33 @@ pub const ALLOC_REGS: &[Reg] = &[
     X12_REG,
 ];
 
-impl Assembler
-{
-    /// Special scratch registers for intermediate processing.
-    /// This register is call-clobbered (so we don't have to save it before using it).
-    /// Avoid using if you can since this is used to lower [Insn] internally and
-    /// so conflicts are possible.
-    pub const SCRATCH_REG: Reg = X16_REG;
-    const SCRATCH0_REG: Reg = Self::SCRATCH_REG;
-    const SCRATCH1_REG: Reg = X17_REG;
-    const SCRATCH0: A64Opnd = A64Opnd::Reg(Self::SCRATCH0_REG);
-    const SCRATCH1: A64Opnd = A64Opnd::Reg(Self::SCRATCH1_REG);
+/// Special scratch register for intermediate processing. It should be used only by
+/// [`Assembler::arm64_split_with_scratch_reg`] or [`Assembler::new_with_scratch_reg`].
+const SCRATCH_OPND: Opnd = Opnd::Reg(X15_REG);
+
+impl Assembler {
+    /// Special registers for intermediate processing in arm64_emit. It should be used only by arm64_emit.
+    /// TODO: Remove the use of these registers by splitting instructions in arm64_split_with_scratch_reg.
+    const EMIT0_REG: Reg = X16_REG;
+    const EMIT1_REG: Reg = X17_REG;
+    const EMIT0_OPND: A64Opnd = A64Opnd::Reg(Self::EMIT0_REG);
+    const EMIT1_OPND: A64Opnd = A64Opnd::Reg(Self::EMIT1_REG);
+
+    /// Return an Assembler with scratch registers disabled in the backend, and a scratch register.
+    pub fn new_with_scratch_reg() -> (Self, Opnd) {
+        (Self::new_with_label_names(Vec::default(), 0, true), SCRATCH_OPND)
+    }
+
+    /// Return true if opnd contains a scratch reg
+    pub fn has_scratch_reg(opnd: Opnd) -> bool {
+        match opnd {
+            Opnd::Reg(_) => opnd == SCRATCH_OPND,
+            Opnd::Mem(Mem { base: MemBase::Reg(reg_no), .. }) => {
+                reg_no == SCRATCH_OPND.unwrap_reg().reg_no
+            }
+            _ => false,
+        }
+    }
 
     /// Get the list of registers from which we will allocate on this platform
     pub fn get_alloc_regs() -> Vec<Reg> {
@@ -372,7 +388,7 @@ impl Assembler
 
         let live_ranges: Vec<LiveRange> = take(&mut self.live_ranges);
         let mut iterator = self.insns.into_iter().enumerate().peekable();
-        let mut asm_local = Assembler::new_with_label_names(take(&mut self.label_names), live_ranges.len());
+        let mut asm_local = Assembler::new_with_label_names(take(&mut self.label_names), live_ranges.len(), self.accept_scratch_reg);
         let asm = &mut asm_local;
 
         while let Some((index, mut insn)) = iterator.next() {
@@ -555,14 +571,6 @@ impl Assembler
                         }
                     }
                 },
-                Insn::IncrCounter { mem, value } => {
-                    let counter_addr = match mem {
-                        Opnd::Mem(_) => asm.lea(*mem),
-                        _ => *mem
-                    };
-
-                    asm.incr_counter(counter_addr, *value);
-                },
                 Insn::JmpOpnd(opnd) => {
                     if let Opnd::Mem(_) = opnd {
                         let opnd0 = split_load_operand(asm, *opnd);
@@ -679,6 +687,58 @@ impl Assembler
         asm_local
     }
 
+    /// Split instructions using scratch registers. To maximize the use of the register pool for
+    /// VRegs, most splits should happen in [`Self::arm64_split`]. However, some instructions
+    /// need to be split with registers after `alloc_regs`, e.g. for `compile_side_exits`, so this
+    /// splits them and uses scratch registers for it.
+    fn arm64_split_with_scratch_reg(mut self) -> Assembler {
+        let iterator = self.insns.into_iter().enumerate().peekable();
+        let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), self.live_ranges.len(), true);
+
+        for (_, mut insn) in iterator {
+            match &mut insn {
+                // For compile_side_exits, support splitting simple C arguments here
+                Insn::CCall { opnds, .. } if !opnds.is_empty() => {
+                    for (i, opnd) in opnds.iter().enumerate() {
+                        asm.load_into(C_ARG_OPNDS[i], *opnd);
+                    }
+                    *opnds = vec![];
+                    asm.push_insn(insn);
+                }
+                &mut Insn::Lea { opnd, out } => {
+                    match (opnd, out) {
+                        // Split here for compile_side_exits
+                        (Opnd::Mem(_), Opnd::Mem(_)) => {
+                            asm.lea_into(SCRATCH_OPND, opnd);
+                            asm.store(out, SCRATCH_OPND);
+                        }
+                        _ => {
+                            asm.push_insn(insn);
+                        }
+                    }
+                }
+                // Convert Opnd::const_ptr into Opnd::Mem. It's split here compile_side_exits.
+                &mut Insn::IncrCounter { mem, value } => {
+                    assert!(matches!(mem, Opnd::UImm(_)));
+                    asm.load_into(SCRATCH_OPND, mem);
+                    asm.lea_into(SCRATCH_OPND, Opnd::mem(64, SCRATCH_OPND, 0));
+                    asm.incr_counter(SCRATCH_OPND, value);
+                }
+                // Resolve ParallelMov that couldn't be handled without a scratch register.
+                Insn::ParallelMov { moves } => {
+                    for (reg, opnd) in Self::resolve_parallel_moves(moves, Some(SCRATCH_OPND)).unwrap() {
+                        asm.load_into(Opnd::Reg(reg), opnd);
+                    }
+                }
+                _ => {
+                    asm.push_insn(insn);
+                }
+            }
+        }
+
+        asm
+    }
+
     /// Emit platform-specific machine code
     /// Returns a list of GC offsets. Can return failure to signal caller to retry.
     fn arm64_emit(&mut self, cb: &mut CodeBlock) -> Option<Vec<CodePtr>> {
@@ -739,8 +799,8 @@ impl Assembler
                     // that if it doesn't match it will skip over the
                     // instructions used for branching.
                     bcond(cb, Condition::inverse(CONDITION), (load_insns + 2).into());
-                    emit_load_value(cb, Assembler::SCRATCH0, dst_addr as u64);
-                    br(cb, Assembler::SCRATCH0);
+                    emit_load_value(cb, Assembler::EMIT0_OPND, dst_addr as u64);
+                    br(cb, Assembler::EMIT0_OPND);
 
                     // Here we'll return the number of instructions that it
                     // took to write out the destination address + 1 for the
@@ -775,10 +835,8 @@ impl Assembler
         }
 
         /// Emit a CBZ or CBNZ which branches when a register is zero or non-zero
-        fn emit_cmp_zero_jump(_cb: &mut CodeBlock, _reg: A64Opnd, _branch_if_zero: bool, target: Target) {
-            if let Target::Label(_) = target {
-                unimplemented!("this should be re-implemented with Label for side exits");
-                /*
+        fn emit_cmp_zero_jump(cb: &mut CodeBlock, reg: A64Opnd, branch_if_zero: bool, target: Target) {
+            if let Target::CodePtr(dst_ptr) = target {
                 let dst_addr = dst_ptr.as_offset();
                 let src_addr = cb.get_write_ptr().as_offset();
 
@@ -806,10 +864,9 @@ impl Assembler
                     } else {
                         cbz(cb, reg, InstructionOffset::from_insns(load_insns + 2));
                     }
-                    emit_load_value(cb, Assembler::SCRATCH0, dst_addr);
-                    br(cb, Assembler::SCRATCH0);
+                    emit_load_value(cb, Assembler::EMIT0_OPND, dst_addr);
+                    br(cb, Assembler::EMIT0_OPND);
                 }
-                */
             } else {
                 unreachable!("We should only generate Joz/Jonz with side-exit targets");
             }
@@ -818,7 +875,9 @@ impl Assembler
         /// Do the address calculation of `out_reg = base_reg + disp`
         fn load_effective_address(cb: &mut CodeBlock, out: A64Opnd, base_reg_no: u8, disp: i32) {
             let base_reg = A64Opnd::Reg(A64Reg { num_bits: 64, reg_no: base_reg_no });
-            assert_ne!(31, out.unwrap_reg().reg_no, "Lea sp, [sp, #imm] not always encodable. Use add/sub instead.");
+            let out_reg_no = out.unwrap_reg().reg_no;
+            assert_ne!(31, out_reg_no, "Lea sp, [sp, #imm] not always encodable. Use add/sub instead.");
+            assert_ne!(base_reg_no, out_reg_no, "large displacement need a scratch register");
 
             if ShiftedImmediate::try_from(disp.unsigned_abs() as u64).is_ok() {
                 // Use ADD/SUB if the displacement fits
@@ -979,7 +1038,7 @@ impl Assembler
                         (Some(Insn::JoMul(_)), _) |
                         (Some(Insn::PosMarker(_)), Some(Insn::JoMul(_))) => {
                             // Compute the high 64 bits
-                            smulh(cb, Self::SCRATCH0, left.into(), right.into());
+                            smulh(cb, Self::EMIT0_OPND, left.into(), right.into());
 
                             // Compute the low 64 bits
                             // This may clobber one of the input registers,
@@ -988,11 +1047,11 @@ impl Assembler
 
                             // Produce a register that is all zeros or all ones
                             // Based on the sign bit of the 64-bit mul result
-                            asr(cb, Self::SCRATCH1, out.into(), A64Opnd::UImm(63));
+                            asr(cb, Self::EMIT1_OPND, out.into(), A64Opnd::UImm(63));
 
                             // If the high 64-bits are not all zeros or all ones,
                             // matching the sign bit, then we have an overflow
-                            cmp(cb, Self::SCRATCH0, Self::SCRATCH1);
+                            cmp(cb, Self::EMIT0_OPND, Self::EMIT1_OPND);
                             // Insn::JoMul will emit_conditional_jump::<{Condition::NE}>
                         }
                         _ => {
@@ -1021,77 +1080,57 @@ impl Assembler
                 Insn::LShift { opnd, shift, out } => {
                     lsl(cb, out.into(), opnd.into(), shift.into());
                 },
-                store_insn @ Insn::Store { dest, src } => {
-                    // With minor exceptions, as long as `dest` is a Mem, all forms of `src` are
-                    // accepted. As a rule of thumb, avoid using Assembler::SCRATCH as a memory
-                    // base register to gurantee things will work.
+                Insn::Store { dest, src } => {
+                    // With minor exceptions, as long as `dest` is a Mem, all forms of `src` are accepted.
                     let &Opnd::Mem(Mem { num_bits: dest_num_bits, base: MemBase::Reg(base_reg_no), disp }) = dest else {
                         panic!("Unexpected Insn::Store destination in arm64_emit: {dest:?}");
                     };
 
-                    // This kind of tricky clobber can only happen for explicit use of SCRATCH_REG,
-                    // so we panic to get the author to change their code.
-                    #[track_caller]
-                    fn assert_no_clobber(store_insn: &Insn, user_use: u8, backend_use: Reg) {
-                        assert_ne!(
-                            backend_use.reg_no,
-                            user_use,
-                            "Emitting {store_insn:?} would clobber {user_use:?}, in conflict with its semantics"
-                        );
-                    }
-
-                    // Split src into SCRATCH0 if necessary
+                    // Split src into EMIT0_OPND if necessary
                     let src_reg: A64Reg = match src {
                         Opnd::Reg(reg) => *reg,
                         // Use zero register when possible
                         Opnd::UImm(0) | Opnd::Imm(0) => XZR_REG,
                         // Immediates
                         &Opnd::Imm(imm) => {
-                            assert_no_clobber(store_insn, base_reg_no, Self::SCRATCH0_REG);
-                            emit_load_value(cb, Self::SCRATCH0, imm as u64);
-                            Self::SCRATCH0_REG
+                            emit_load_value(cb, Self::EMIT0_OPND, imm as u64);
+                            Self::EMIT0_REG
                         }
                         &Opnd::UImm(imm) => {
-                            assert_no_clobber(store_insn, base_reg_no, Self::SCRATCH0_REG);
-                            emit_load_value(cb, Self::SCRATCH0, imm);
-                            Self::SCRATCH0_REG
+                            emit_load_value(cb, Self::EMIT0_OPND, imm);
+                            Self::EMIT0_REG
                         }
                         &Opnd::Value(value) => {
-                            assert_no_clobber(store_insn, base_reg_no, Self::SCRATCH0_REG);
-                            emit_load_gc_value(cb, &mut gc_offsets, Self::SCRATCH0, value);
-                            Self::SCRATCH0_REG
+                            emit_load_gc_value(cb, &mut gc_offsets, Self::EMIT0_OPND, value);
+                            Self::EMIT0_REG
                         }
                         src_mem @ &Opnd::Mem(Mem { num_bits: src_num_bits, base: MemBase::Reg(src_base_reg_no), disp: src_disp }) => {
-                            // For mem-to-mem store, load the source into SCRATCH0
-                            assert_no_clobber(store_insn, base_reg_no, Self::SCRATCH0_REG);
+                            // For mem-to-mem store, load the source into EMIT0_OPND
                             let src_mem = if mem_disp_fits_bits(src_disp) {
                                 src_mem.into()
                             } else {
-                                // Split the load address into SCRATCH0 first if necessary
-                                assert_no_clobber(store_insn, src_base_reg_no, Self::SCRATCH0_REG);
-                                load_effective_address(cb, Self::SCRATCH0, src_base_reg_no, src_disp);
-                                A64Opnd::new_mem(dest_num_bits, Self::SCRATCH0, 0)
+                                // Split the load address into EMIT0_OPND first if necessary
+                                load_effective_address(cb, Self::EMIT0_OPND, src_base_reg_no, src_disp);
+                                A64Opnd::new_mem(dest_num_bits, Self::EMIT0_OPND, 0)
                             };
                             match src_num_bits {
-                                64 | 32 => ldur(cb, Self::SCRATCH0, src_mem),
-                                16 => ldurh(cb, Self::SCRATCH0, src_mem),
-                                8 => ldurb(cb, Self::SCRATCH0, src_mem),
+                                64 | 32 => ldur(cb, Self::EMIT0_OPND, src_mem),
+                                16 => ldurh(cb, Self::EMIT0_OPND, src_mem),
+                                8 => ldurb(cb, Self::EMIT0_OPND, src_mem),
                                 num_bits => panic!("unexpected num_bits: {num_bits}")
                             };
-                            Self::SCRATCH0_REG
+                            Self::EMIT0_REG
                         }
                         src @ (Opnd::Mem(_) | Opnd::None | Opnd::VReg { .. }) => panic!("Unexpected source operand during arm64_emit: {src:?}")
                     };
                     let src = A64Opnd::Reg(src_reg);
 
-                    // Split dest into SCRATCH1 if necessary.
+                    // Split dest into EMIT1_OPND if necessary.
                     let dest = if mem_disp_fits_bits(disp) {
                         dest.into()
                     } else {
-                        assert_no_clobber(store_insn, src_reg.reg_no, Self::SCRATCH1_REG);
-                        assert_no_clobber(store_insn, base_reg_no, Self::SCRATCH1_REG);
-                        load_effective_address(cb, Self::SCRATCH1, base_reg_no, disp);
-                        A64Opnd::new_mem(dest_num_bits, Self::SCRATCH1, 0)
+                        load_effective_address(cb, Self::EMIT1_OPND, base_reg_no, disp);
+                        A64Opnd::new_mem(dest_num_bits, Self::EMIT1_OPND, 0)
                     };
 
                     // This order may be surprising but it is correct. The way
@@ -1163,16 +1202,36 @@ impl Assembler
                     let &Opnd::Mem(Mem { num_bits: _, base: MemBase::Reg(base_reg_no), disp }) = opnd else {
                         panic!("Unexpected Insn::Lea operand in arm64_emit: {opnd:?}");
                     };
-                    load_effective_address(cb, out.into(), base_reg_no, disp);
+                    let out_reg_no = out.unwrap_reg().reg_no;
+                    assert_ne!(31, out_reg_no, "Lea sp, [sp, #imm] not always encodable. Use add/sub instead.");
+
+                    let out = A64Opnd::from(out);
+                    let base_reg = A64Opnd::Reg(A64Reg { num_bits: 64, reg_no: base_reg_no });
+                    if ShiftedImmediate::try_from(disp.unsigned_abs() as u64).is_ok() {
+                        // Use ADD/SUB if the displacement fits
+                        add(cb, out, base_reg, A64Opnd::new_imm(disp.into()));
+                    } else {
+                        // Use a scratch reg for `out += displacement`
+                        let disp_reg = if out_reg_no == base_reg_no {
+                            Self::EMIT0_OPND
+                        } else {
+                            out
+                        };
+                        // Use add_extended() to interpret reg_no=31 as sp
+                        // since the base register is never the zero register.
+                        // Careful! Only the first two operands can refer to sp.
+                        emit_load_value(cb, disp_reg, disp as u64);
+                        add_extended(cb, out, base_reg, disp_reg);
+                    }
                 }
                 Insn::LeaJumpTarget { out, target, .. } => {
                     if let Target::Label(label_idx) = target {
                         // Set output to the raw address of the label
                         cb.label_ref(*label_idx, 4, |cb, end_addr, dst_addr| {
-                            adr(cb, Self::SCRATCH0, A64Opnd::new_imm(dst_addr - (end_addr - 4)));
+                            adr(cb, Self::EMIT0_OPND, A64Opnd::new_imm(dst_addr - (end_addr - 4)));
                         });
 
-                        mov(cb, out.into(), Self::SCRATCH0);
+                        mov(cb, out.into(), Self::EMIT0_OPND);
                     } else {
                         // Set output to the jump target's raw address
                         let target_code = target.unwrap_code_ptr();
@@ -1197,15 +1256,15 @@ impl Assembler
                     }
 
                     // Push the flags/state register
-                    mrs(cb, Self::SCRATCH0, SystemRegister::NZCV);
-                    emit_push(cb, Self::SCRATCH0);
+                    mrs(cb, Self::EMIT0_OPND, SystemRegister::NZCV);
+                    emit_push(cb, Self::EMIT0_OPND);
                 },
                 Insn::CPopAll => {
                     let regs = Assembler::get_caller_save_regs();
 
                     // Pop the state/flags register
-                    msr(cb, SystemRegister::NZCV, Self::SCRATCH0);
-                    emit_pop(cb, Self::SCRATCH0);
+                    msr(cb, SystemRegister::NZCV, Self::EMIT0_OPND);
+                    emit_pop(cb, Self::EMIT0_OPND);
 
                     for reg in regs.into_iter().rev() {
                         emit_pop(cb, A64Opnd::Reg(reg));
@@ -1221,8 +1280,8 @@ impl Assembler
                     if b_offset_fits_bits((dst_addr - src_addr) / 4) {
                         bl(cb, InstructionOffset::from_bytes((dst_addr - src_addr) as i32));
                     } else {
-                        emit_load_value(cb, Self::SCRATCH0, dst_addr as u64);
-                        blr(cb, Self::SCRATCH0);
+                        emit_load_value(cb, Self::EMIT0_OPND, dst_addr as u64);
+                        blr(cb, Self::EMIT0_OPND);
                     }
                 },
                 Insn::CRet { .. } => {
@@ -1302,17 +1361,17 @@ impl Assembler
                     let label = cb.new_label("incr_counter_loop".to_string());
                     cb.write_label(label);
 
-                    ldaxr(cb, Self::SCRATCH0, mem.into());
-                    add(cb, Self::SCRATCH0, Self::SCRATCH0, value.into());
+                    ldaxr(cb, Self::EMIT0_OPND, mem.into());
+                    add(cb, Self::EMIT0_OPND, Self::EMIT0_OPND, value.into());
 
                     // The status register that gets used to track whether or
                     // not the store was successful must be 32 bytes. Since we
-                    // store the SCRATCH registers as their 64-bit versions, we
+                    // store the EMIT registers as their 64-bit versions, we
                     // need to rewrap it here.
-                    let status = A64Opnd::Reg(Self::SCRATCH1.unwrap_reg().with_num_bits(32));
-                    stlxr(cb, status, Self::SCRATCH0, mem.into());
+                    let status = A64Opnd::Reg(Self::EMIT1_REG.with_num_bits(32));
+                    stlxr(cb, status, Self::EMIT0_OPND, mem.into());
 
-                    cmp(cb, Self::SCRATCH1, A64Opnd::new_uimm(0));
+                    cmp(cb, Self::EMIT1_OPND, A64Opnd::new_uimm(0));
                     emit_conditional_jump::<{Condition::NE}>(cb, Target::Label(label));
                 },
                 Insn::Breakpoint => {
@@ -1363,9 +1422,16 @@ impl Assembler
 
     /// Optimize and compile the stored instructions
     pub fn compile_with_regs(self, cb: &mut CodeBlock, regs: Vec<Reg>) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
+        // The backend is allowed to use scratch registers only if it has not accepted them so far.
+        let use_scratch_reg = !self.accept_scratch_reg;
+
         let asm = self.arm64_split();
         let mut asm = asm.alloc_regs(regs)?;
+        // We put compile_side_exits after alloc_regs to avoid extending live ranges for VRegs spilled on side exits.
         asm.compile_side_exits();
+        if use_scratch_reg {
+            asm = asm.arm64_split_with_scratch_reg();
+        }
 
         // Create label instances in the code block
         for (idx, name) in asm.label_names.iter().enumerate() {
@@ -1422,6 +1488,10 @@ fn merge_three_reg_mov(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "disasm")]
+    use crate::disasms_with;
+    use crate::{assert_disasm_snapshot, hexdumps};
+
     use super::*;
     use insta::assert_snapshot;
 
@@ -1439,11 +1509,11 @@ mod tests {
         asm.mov(Opnd::Reg(TEMP_REGS[0]), out);
         asm.compile_with_num_regs(&mut cb, 2);
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: mov x0, #3
             0x4: mul x0, x9, x0
             0x8: mov x1, x0
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"600080d2207d009be10300aa");
     }
 
@@ -1458,10 +1528,10 @@ mod tests {
         asm.mov(sp, new_sp);
 
         asm.compile_with_num_regs(&mut cb, 2);
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: add sp, sp, #0x20
             0x4: sub sp, sp, #0x20
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"ff830091ff8300d1");
     }
 
@@ -1474,10 +1544,10 @@ mod tests {
         asm.add_into(Opnd::Reg(X20_REG), 0x20.into());
 
         asm.compile_with_num_regs(&mut cb, 0);
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: add sp, sp, #8
             0x4: adds x20, x20, #0x20
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"ff230091948200b1");
     }
 
@@ -1489,11 +1559,11 @@ mod tests {
         asm.load_into(Opnd::Reg(X1_REG), difference);
 
         asm.compile_with_num_regs(&mut cb, 1);
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: mov x0, #8
             0x4: subs x0, x0, x5
             0x8: mov x1, x0
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"000180d2000005ebe10300aa");
     }
 
@@ -1505,10 +1575,10 @@ mod tests {
         asm.cret(ret_val);
 
         asm.compile_with_num_regs(&mut cb, 1);
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: ldur x0, [x0]
             0x4: ret
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"000040f8c0035fd6");
     }
 
@@ -1521,7 +1591,11 @@ mod tests {
         asm.compile_with_regs(&mut cb, vec![X3_REG]).unwrap();
 
         // Assert that only 2 instructions were written.
-        assert_eq!(8, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: adds x3, x0, x1
+        0x4: stur x3, [x2]
+        ");
+        assert_snapshot!(cb.hexdump(), @"030001ab430000f8");
     }
 
     #[test]
@@ -1533,7 +1607,13 @@ mod tests {
 
         // Testing that we pad the string to the nearest 4-byte boundary to make
         // it easier to jump over.
-        assert_eq!(16, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: ldnp d8, d25, [x10, #-0x140]
+        0x4: .byte 0x6f, 0x2c, 0x20, 0x77
+        0x8: .byte 0x6f, 0x72, 0x6c, 0x64
+        0xc: .byte 0x21, 0x00, 0x00, 0x00
+        ");
+        assert_snapshot!(cb.hexdump(), @"48656c6c6f2c20776f726c6421000000");
     }
 
     #[test]
@@ -1542,6 +1622,20 @@ mod tests {
 
         asm.cpush_all();
         asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: str x1, [sp, #-0x10]!
+        0x4: str x9, [sp, #-0x10]!
+        0x8: str x10, [sp, #-0x10]!
+        0xc: str x11, [sp, #-0x10]!
+        0x10: str x12, [sp, #-0x10]!
+        0x14: str x13, [sp, #-0x10]!
+        0x18: str x14, [sp, #-0x10]!
+        0x1c: str x15, [sp, #-0x10]!
+        0x20: mrs x16, nzcv
+        0x24: str x16, [sp, #-0x10]!
+        ");
+        assert_snapshot!(cb.hexdump(), @"e10f1ff8e90f1ff8ea0f1ff8eb0f1ff8ec0f1ff8ed0f1ff8ee0f1ff8ef0f1ff810423bd5f00f1ff8");
     }
 
     #[test]
@@ -1550,6 +1644,20 @@ mod tests {
 
         asm.cpop_all();
         asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: msr nzcv, x16
+        0x4: ldr x16, [sp], #0x10
+        0x8: ldr x15, [sp], #0x10
+        0xc: ldr x14, [sp], #0x10
+        0x10: ldr x13, [sp], #0x10
+        0x14: ldr x12, [sp], #0x10
+        0x18: ldr x11, [sp], #0x10
+        0x1c: ldr x10, [sp], #0x10
+        0x20: ldr x9, [sp], #0x10
+        0x24: ldr x1, [sp], #0x10
+        ");
+        assert_snapshot!(cb.hexdump(), @"10421bd5f00741f8ef0741f8ee0741f8ed0741f8ec0741f8eb0741f8ea0741f8e90741f8e10741f8");
     }
 
     #[test]
@@ -1559,71 +1667,83 @@ mod tests {
         asm.frame_setup(&[], 0);
         asm.frame_teardown(&[]);
         asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: stp x29, x30, [sp, #-0x10]!
+        0x4: mov x29, sp
+        0x8: mov sp, x29
+        0xc: ldp x29, x30, [sp], #0x10
+        ");
+        assert_snapshot!(cb.hexdump(), @"fd7bbfa9fd030091bf030091fd7bc1a8");
     }
 
     #[test]
     fn frame_setup_and_teardown() {
         const THREE_REGS: &[Opnd] = &[Opnd::Reg(X19_REG), Opnd::Reg(X20_REG), Opnd::Reg(X21_REG)];
         // Test 3 preserved regs (odd), odd slot_count
-        {
+        let cb1 = {
             let (mut asm, mut cb) = setup_asm();
             asm.frame_setup(THREE_REGS, 3);
             asm.frame_teardown(THREE_REGS);
             asm.compile_with_num_regs(&mut cb, 0);
-            cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
-                0x0: stp x29, x30, [sp, #-0x10]!
-                0x4: mov x29, sp
-                0x8: stp x20, x19, [sp, #-0x10]!
-                0xc: stur x21, [sp, #-8]
-                0x10: sub sp, sp, #0x20
-                0x14: ldp x20, x19, [x29, #-0x10]
-                0x18: ldur x21, [x29, #-0x18]
-                0x1c: mov sp, x29
-                0x20: ldp x29, x30, [sp], #0x10
-            "));
-            assert_snapshot!(cb.hexdump(), @"fd7bbfa9fd030091f44fbfa9f5831ff8ff8300d1b44f7fa9b5835ef8bf030091fd7bc1a8");
-        }
+            cb
+        };
 
         // Test 3 preserved regs (odd), even slot_count
-        {
+        let cb2 = {
             let (mut asm, mut cb) = setup_asm();
             asm.frame_setup(THREE_REGS, 4);
             asm.frame_teardown(THREE_REGS);
             asm.compile_with_num_regs(&mut cb, 0);
-            cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
-                0x0: stp x29, x30, [sp, #-0x10]!
-                0x4: mov x29, sp
-                0x8: stp x20, x19, [sp, #-0x10]!
-                0xc: stur x21, [sp, #-8]
-                0x10: sub sp, sp, #0x30
-                0x14: ldp x20, x19, [x29, #-0x10]
-                0x18: ldur x21, [x29, #-0x18]
-                0x1c: mov sp, x29
-                0x20: ldp x29, x30, [sp], #0x10
-            "));
-            assert_snapshot!(cb.hexdump(), @"fd7bbfa9fd030091f44fbfa9f5831ff8ffc300d1b44f7fa9b5835ef8bf030091fd7bc1a8");
-        }
+            cb
+        };
 
         // Test 4 preserved regs (even), odd slot_count
-        {
+        let cb3 = {
             static FOUR_REGS: &[Opnd] = &[Opnd::Reg(X19_REG), Opnd::Reg(X20_REG), Opnd::Reg(X21_REG), Opnd::Reg(X22_REG)];
             let (mut asm, mut cb) = setup_asm();
             asm.frame_setup(FOUR_REGS, 3);
             asm.frame_teardown(FOUR_REGS);
             asm.compile_with_num_regs(&mut cb, 0);
-            cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
-                0x0: stp x29, x30, [sp, #-0x10]!
-                0x4: mov x29, sp
-                0x8: stp x20, x19, [sp, #-0x10]!
-                0xc: stp x22, x21, [sp, #-0x10]!
-                0x10: sub sp, sp, #0x20
-                0x14: ldp x20, x19, [x29, #-0x10]
-                0x18: ldp x22, x21, [x29, #-0x20]
-                0x1c: mov sp, x29
-                0x20: ldp x29, x30, [sp], #0x10
-            "));
-            assert_snapshot!(cb.hexdump(), @"fd7bbfa9fd030091f44fbfa9f657bfa9ff8300d1b44f7fa9b6577ea9bf030091fd7bc1a8");
-        }
+            cb
+        };
+
+        assert_disasm_snapshot!(disasms_with!("\n", cb1, cb2, cb3), @r"
+        0x0: stp x29, x30, [sp, #-0x10]!
+        0x4: mov x29, sp
+        0x8: stp x20, x19, [sp, #-0x10]!
+        0xc: stur x21, [sp, #-8]
+        0x10: sub sp, sp, #0x20
+        0x14: ldp x20, x19, [x29, #-0x10]
+        0x18: ldur x21, [x29, #-0x18]
+        0x1c: mov sp, x29
+        0x20: ldp x29, x30, [sp], #0x10
+
+        0x0: stp x29, x30, [sp, #-0x10]!
+        0x4: mov x29, sp
+        0x8: stp x20, x19, [sp, #-0x10]!
+        0xc: stur x21, [sp, #-8]
+        0x10: sub sp, sp, #0x30
+        0x14: ldp x20, x19, [x29, #-0x10]
+        0x18: ldur x21, [x29, #-0x18]
+        0x1c: mov sp, x29
+        0x20: ldp x29, x30, [sp], #0x10
+
+        0x0: stp x29, x30, [sp, #-0x10]!
+        0x4: mov x29, sp
+        0x8: stp x20, x19, [sp, #-0x10]!
+        0xc: stp x22, x21, [sp, #-0x10]!
+        0x10: sub sp, sp, #0x20
+        0x14: ldp x20, x19, [x29, #-0x10]
+        0x18: ldp x22, x21, [x29, #-0x20]
+        0x1c: mov sp, x29
+        0x20: ldp x29, x30, [sp], #0x10
+        ");
+        assert_snapshot!(hexdumps!(cb1, cb2, cb3), @r"
+        fd7bbfa9fd030091f44fbfa9f5831ff8ff8300d1b44f7fa9b5835ef8bf030091fd7bc1a8
+        fd7bbfa9fd030091f44fbfa9f5831ff8ffc300d1b44f7fa9b5835ef8bf030091fd7bc1a8
+        fd7bbfa9fd030091f44fbfa9f657bfa9ff8300d1b44f7fa9b6577ea9bf030091fd7bc1a8
+        ");
     }
 
     #[test]
@@ -1634,6 +1754,16 @@ mod tests {
 
         asm.je(Target::CodePtr(target));
         asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: b.eq #0x50
+        0x4: nop
+        0x8: nop
+        0xc: nop
+        0x10: nop
+        0x14: nop
+        ");
+        assert_snapshot!(cb.hexdump(), @"800200541f2003d51f2003d51f2003d51f2003d51f2003d5");
     }
 
     #[test]
@@ -1645,6 +1775,16 @@ mod tests {
 
         asm.je(Target::CodePtr(target));
         asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: b.ne #8
+        0x4: b #0x200000
+        0x8: nop
+        0xc: nop
+        0x10: nop
+        0x14: nop
+        ");
+        assert_snapshot!(cb.hexdump(), @"41000054ffff07141f2003d51f2003d51f2003d51f2003d5");
     }
 
     #[test]
@@ -1662,7 +1802,7 @@ mod tests {
         }
 
         asm.compile_with_num_regs(&mut cb, 0);
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @r"
+        assert_disasm_snapshot!(cb.disasm(), @r"
             0x0: orr x0, xzr, #0x7fffffff
             0x4: add x0, sp, x0
             0x8: mov x0, #8
@@ -1681,8 +1821,27 @@ mod tests {
             0x3c: add x0, sp, x0
             0x40: orr x0, xzr, #0xffffffff80000000
             0x44: add x0, sp, x0
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"e07b40b2e063208b000180d22000a0f2e063208b000083d2e063208be0230891e02308d1e0ff8292e063208b00ff9fd2c0ffbff2e0ffdff2e0fffff2e063208be08361b2e063208b");
+    }
+
+    #[test]
+    fn test_load_larg_disp_mem() {
+        let (mut asm, mut cb) = setup_asm();
+
+        let extended_ivars = asm.load(Opnd::mem(64, NATIVE_STACK_PTR, 0));
+        let result = asm.load(Opnd::mem(VALUE_BITS, extended_ivars, 1000 * SIZEOF_VALUE_I32));
+        asm.store(Opnd::mem(VALUE_BITS, NATIVE_STACK_PTR, 0), result);
+
+        asm.compile_with_num_regs(&mut cb, 1);
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: ldur x0, [sp]
+        0x4: mov x16, #0x1f40
+        0x8: add x0, x0, x16, uxtx
+        0xc: ldur x0, [x0]
+        0x10: stur x0, [sp]
+        ");
+        assert_snapshot!(cb.hexdump(), @"e00340f810e883d20060308b000040f8e00300f8");
     }
 
     #[test]
@@ -1697,7 +1856,7 @@ mod tests {
         asm.store(large_mem, large_mem);
 
         asm.compile_with_num_regs(&mut cb, 0);
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: sub x16, sp, #0x305
             0x4: ldur x16, [x16]
             0x8: stur x16, [x0]
@@ -1708,7 +1867,7 @@ mod tests {
             0x1c: ldur x16, [x16]
             0x20: sub x17, sp, #0x305
             0x24: stur x16, [x17]
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"f0170cd1100240f8100000f8100040f8f1170cd1300200f8f0170cd1100240f8f1170cd1300200f8");
     }
 
@@ -1725,22 +1884,49 @@ mod tests {
         let gc_offsets = asm.arm64_emit(&mut cb).unwrap();
         assert_eq!(1, gc_offsets.len(), "VALUE source operand should be reported as gc offset");
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: ldr x16, #8
             0x4: b #0x10
             0x8: .byte 0x00, 0x10, 0x00, 0x00
             0xc: .byte 0x00, 0x00, 0x00, 0x00
             0x10: stur x16, [x21]
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"50000058030000140010000000000000b00200f8");
     }
 
     #[test]
+    fn test_store_with_valid_scratch_reg() {
+        let (mut asm, scratch_reg) = Assembler::new_with_scratch_reg();
+        let mut cb = CodeBlock::new_dummy();
+        asm.store(Opnd::mem(64, scratch_reg, 0), 0x83902.into());
+
+        asm.compile_with_num_regs(&mut cb, 0);
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: mov x16, #0x3902
+        0x4: movk x16, #8, lsl #16
+        0x8: stur x16, [x15]
+        ");
+        assert_snapshot!(cb.hexdump(), @"502087d21001a0f2f00100f8");
+    }
+
+    #[test]
     #[should_panic]
-    fn test_store_unserviceable() {
+    fn test_store_with_invalid_scratch_reg() {
+        let (_, scratch_reg) = Assembler::new_with_scratch_reg();
         let (mut asm, mut cb) = setup_asm();
-        // This would put the source into SCRATCH_REG, messing up the destination
-        asm.store(Opnd::mem(64, SCRATCH_OPND, 0), 0x83902.into());
+        // This would put the source into scratch_reg, messing up the destination
+        asm.store(Opnd::mem(64, scratch_reg, 0), 0x83902.into());
+
+        asm.compile_with_num_regs(&mut cb, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_load_into_with_invalid_scratch_reg() {
+        let (_, scratch_reg) = Assembler::new_with_scratch_reg();
+        let (mut asm, mut cb) = setup_asm();
+        // This would put the source into scratch_reg, messing up the destination
+        asm.load_into(scratch_reg, 0x83902.into());
 
         asm.compile_with_num_regs(&mut cb, 0);
     }
@@ -1757,6 +1943,16 @@ mod tests {
         asm.store(Opnd::mem(64, SP, 0), opnd);
 
         asm.compile_with_num_regs(&mut cb, 1);
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: adr x16, #8
+        0x4: mov x0, x16
+        0x8: ldnp d8, d25, [x10, #-0x140]
+        0xc: .byte 0x6f, 0x2c, 0x20, 0x77
+        0x10: .byte 0x6f, 0x72, 0x6c, 0x64
+        0x14: .byte 0x21, 0x00, 0x00, 0x00
+        0x18: stur x0, [x21]
+        ");
+        assert_snapshot!(cb.hexdump(), @"50000010e00310aa48656c6c6f2c20776f726c6421000000a00200f8");
     }
 
     #[test]
@@ -1768,7 +1964,11 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 1);
 
         // Assert that two instructions were written: LDUR and STUR.
-        assert_eq!(8, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: ldur x0, [x21]
+        0x4: stur x0, [x21]
+        ");
+        assert_snapshot!(cb.hexdump(), @"a00240f8a00200f8");
     }
 
     #[test]
@@ -1780,7 +1980,12 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 1);
 
         // Assert that three instructions were written: ADD, LDUR, and STUR.
-        assert_eq!(12, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: add x0, x21, #0x400
+        0x4: ldur x0, [x0]
+        0x8: stur x0, [x21]
+        ");
+        assert_snapshot!(cb.hexdump(), @"a0021091000040f8a00200f8");
     }
 
     #[test]
@@ -1792,7 +1997,13 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 1);
 
         // Assert that three instructions were written: MOVZ, ADD, LDUR, and STUR.
-        assert_eq!(16, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: mov x0, #0x1001
+        0x4: add x0, x21, x0, uxtx
+        0x8: ldur x0, [x0]
+        0xc: stur x0, [x21]
+        ");
+        assert_snapshot!(cb.hexdump(), @"200082d2a062208b000040f8a00200f8");
     }
 
     #[test]
@@ -1805,7 +2016,11 @@ mod tests {
 
         // Assert that only two instructions were written since the value is an
         // immediate.
-        assert_eq!(8, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: mov x0, #4
+        0x4: stur x0, [x21]
+        ");
+        assert_snapshot!(cb.hexdump(), @"800080d2a00200f8");
     }
 
     #[test]
@@ -1818,7 +2033,14 @@ mod tests {
 
         // Assert that five instructions were written since the value is not an
         // immediate and needs to be loaded into a register.
-        assert_eq!(20, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: ldr x0, #8
+        0x4: b #0x10
+        0x8: eon x0, x0, x30, ror #0
+        0xc: eon x30, x23, x30, ror #50
+        0x10: stur x0, [x21]
+        ");
+        assert_snapshot!(cb.hexdump(), @"40000058030000140000fecafecafecaa00200f8");
     }
 
     #[test]
@@ -1829,6 +2051,12 @@ mod tests {
         // All ones is not encodable with a bitmask immediate,
         // so this needs one register
         asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: orr x0, xzr, #0xffffffff
+        0x4: tst w0, w0
+        ");
+        assert_snapshot!(cb.hexdump(), @"e07f40b21f00006a");
     }
 
     #[test]
@@ -1837,6 +2065,9 @@ mod tests {
         let w0 = Opnd::Reg(X0_REG).with_num_bits(32);
         asm.test(w0, Opnd::UImm(0x80000001));
         asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: tst w0, #0x80000001");
+        assert_snapshot!(cb.hexdump(), @"1f040172");
     }
 
     #[test]
@@ -1846,6 +2077,12 @@ mod tests {
         let opnd = asm.or(Opnd::Reg(X0_REG), Opnd::Reg(X1_REG));
         asm.store(Opnd::mem(64, Opnd::Reg(X2_REG), 0), opnd);
         asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: orr x0, x0, x1
+        0x4: stur x0, [x2]
+        ");
+        assert_snapshot!(cb.hexdump(), @"000001aa400000f8");
     }
 
     #[test]
@@ -1855,6 +2092,12 @@ mod tests {
         let opnd = asm.lshift(Opnd::Reg(X0_REG), Opnd::UImm(5));
         asm.store(Opnd::mem(64, Opnd::Reg(X2_REG), 0), opnd);
         asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: lsl x0, x0, #5
+        0x4: stur x0, [x2]
+        ");
+        assert_snapshot!(cb.hexdump(), @"00e87bd3400000f8");
     }
 
     #[test]
@@ -1864,6 +2107,12 @@ mod tests {
         let opnd = asm.rshift(Opnd::Reg(X0_REG), Opnd::UImm(5));
         asm.store(Opnd::mem(64, Opnd::Reg(X2_REG), 0), opnd);
         asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: asr x0, x0, #5
+        0x4: stur x0, [x2]
+        ");
+        assert_snapshot!(cb.hexdump(), @"00fc4593400000f8");
     }
 
     #[test]
@@ -1873,6 +2122,12 @@ mod tests {
         let opnd = asm.urshift(Opnd::Reg(X0_REG), Opnd::UImm(5));
         asm.store(Opnd::mem(64, Opnd::Reg(X2_REG), 0), opnd);
         asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: lsr x0, x0, #5
+        0x4: stur x0, [x2]
+        ");
+        assert_snapshot!(cb.hexdump(), @"00fc45d3400000f8");
     }
 
     #[test]
@@ -1883,7 +2138,8 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 0);
 
         // Assert that only one instruction was written.
-        assert_eq!(4, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: tst x0, x1");
+        assert_snapshot!(cb.hexdump(), @"1f0001ea");
     }
 
     #[test]
@@ -1894,7 +2150,8 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 0);
 
         // Assert that only one instruction was written.
-        assert_eq!(4, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: tst x0, #7");
+        assert_snapshot!(cb.hexdump(), @"1f0840f2");
     }
 
     #[test]
@@ -1905,7 +2162,11 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 1);
 
         // Assert that a load and a test instruction were written.
-        assert_eq!(8, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: mov x0, #5
+        0x4: tst x0, x0
+        ");
+        assert_snapshot!(cb.hexdump(), @"a00080d21f0000ea");
     }
 
     #[test]
@@ -1916,7 +2177,8 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 0);
 
         // Assert that only one instruction was written.
-        assert_eq!(4, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: tst x0, #7");
+        assert_snapshot!(cb.hexdump(), @"1f0840f2");
     }
 
     #[test]
@@ -1927,7 +2189,11 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 1);
 
         // Assert that a load and a test instruction were written.
-        assert_eq!(8, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: mov x0, #5
+        0x4: tst x0, x0
+        ");
+        assert_snapshot!(cb.hexdump(), @"a00080d21f0000ea");
     }
 
     #[test]
@@ -1938,7 +2204,8 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 1);
 
         // Assert that a test instruction is written.
-        assert_eq!(4, cb.get_write_pos());
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: tst x0, #-7");
+        assert_snapshot!(cb.hexdump(), @"1ff47df2");
     }
 
     #[test]
@@ -1948,6 +2215,13 @@ mod tests {
         let shape_opnd = Opnd::mem(32, Opnd::Reg(X0_REG), 6);
         asm.cmp(shape_opnd, Opnd::UImm(4097));
         asm.compile_with_num_regs(&mut cb, 2);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: ldur w0, [x0, #6]
+        0x4: mov x1, #0x1001
+        0x8: cmp w0, w1
+        ");
+        assert_snapshot!(cb.hexdump(), @"006040b8210082d21f00016b");
     }
 
     #[test]
@@ -1957,6 +2231,12 @@ mod tests {
         let shape_opnd = Opnd::mem(16, Opnd::Reg(X0_REG), 0);
         asm.store(shape_opnd, Opnd::UImm(4097));
         asm.compile_with_num_regs(&mut cb, 2);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: mov x16, #0x1001
+        0x4: sturh w16, [x0]
+        ");
+        assert_snapshot!(cb.hexdump(), @"300082d210000078");
     }
 
     #[test]
@@ -1966,6 +2246,12 @@ mod tests {
         let shape_opnd = Opnd::mem(32, Opnd::Reg(X0_REG), 6);
         asm.store(shape_opnd, Opnd::UImm(4097));
         asm.compile_with_num_regs(&mut cb, 2);
+
+        assert_disasm_snapshot!(cb.disasm(), @r"
+        0x0: mov x16, #0x1001
+        0x4: stur w16, [x0, #6]
+        ");
+        assert_snapshot!(cb.hexdump(), @"300082d2106000b8");
     }
 
     #[test]
@@ -1977,10 +2263,10 @@ mod tests {
 
         asm.compile_with_num_regs(&mut cb, 1);
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: eor x0, x0, x1
             0x4: stur x0, [x2]
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"000001ca400000f8");
     }
 
@@ -2015,7 +2301,7 @@ mod tests {
         asm.mov(Opnd::Reg(TEMP_REGS[0]), Opnd::mem(64, CFP, 8));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"  0x0: ldur x1, [x19, #8]"));
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: ldur x1, [x19, #8]");
         assert_snapshot!(cb.hexdump(), @"618240f8");
     }
 
@@ -2027,10 +2313,10 @@ mod tests {
         asm.mov(Opnd::Reg(TEMP_REGS[0]), Opnd::UImm(0x10000));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: mov x1, #0xffff
             0x4: orr x1, xzr, #0x10000
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"e1ff9fd2e10370b2");
     }
 
@@ -2042,11 +2328,11 @@ mod tests {
         asm.mov(Opnd::Reg(TEMP_REGS[0]), out);
         asm.compile_with_num_regs(&mut cb, 2);
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: mov x0, #0x14
             0x4: mov x1, #0
             0x8: csel x1, x0, x1, lt
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"800280d2010080d201b0819a");
     }
 
@@ -2087,10 +2373,10 @@ mod tests {
         asm.mov(Opnd::Reg(TEMP_REGS[0]), out);
         asm.compile_with_num_regs(&mut cb, 2);
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: adds x0, x9, #1
             0x4: adds x1, x0, #1
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"200500b1010400b1");
     }
 
@@ -2105,10 +2391,10 @@ mod tests {
         ]);
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
+        assert_disasm_snapshot!(cb.disasm(), @"
             0x0: mov x16, #0
             0x4: blr x16
-        "));
+        ");
         assert_snapshot!(cb.hexdump(), @"100080d200023fd6");
     }
 
@@ -2125,14 +2411,14 @@ mod tests {
         ]);
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
-            0x0: mov x16, x0
+        assert_disasm_snapshot!(cb.disasm(), @"
+            0x0: mov x15, x0
             0x4: mov x0, x1
-            0x8: mov x1, x16
+            0x8: mov x1, x15
             0xc: mov x16, #0
             0x10: blr x16
-        "));
-        assert_snapshot!(cb.hexdump(), @"f00300aae00301aae10310aa100080d200023fd6");
+        ");
+        assert_snapshot!(cb.hexdump(), @"ef0300aae00301aae1030faa100080d200023fd6");
     }
 
     #[test]
@@ -2149,17 +2435,17 @@ mod tests {
         ]);
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
-            0x0: mov x16, x2
+        assert_disasm_snapshot!(cb.disasm(), @"
+            0x0: mov x15, x2
             0x4: mov x2, x3
-            0x8: mov x3, x16
-            0xc: mov x16, x0
+            0x8: mov x3, x15
+            0xc: mov x15, x0
             0x10: mov x0, x1
-            0x14: mov x1, x16
+            0x14: mov x1, x15
             0x18: mov x16, #0
             0x1c: blr x16
-        "));
-        assert_snapshot!(cb.hexdump(), @"f00302aae20303aae30310aaf00300aae00301aae10310aa100080d200023fd6");
+        ");
+        assert_snapshot!(cb.hexdump(), @"ef0302aae20303aae3030faaef0300aae00301aae1030faa100080d200023fd6");
     }
 
     #[test]
@@ -2175,14 +2461,14 @@ mod tests {
         ]);
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
-        cb.with_disasm(|disasm| assert_snapshot!(disasm, @"
-            0x0: mov x16, x0
+        assert_disasm_snapshot!(cb.disasm(), @"
+            0x0: mov x15, x0
             0x4: mov x0, x1
             0x8: mov x1, x2
-            0xc: mov x2, x16
+            0xc: mov x2, x15
             0x10: mov x16, #0
             0x14: blr x16
-        "));
-        assert_snapshot!(cb.hexdump(), @"f00300aae00301aae10302aae20310aa100080d200023fd6");
+        ");
+        assert_snapshot!(cb.hexdump(), @"ef0300aae00301aae10302aae2030faa100080d200023fd6");
     }
 }

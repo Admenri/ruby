@@ -127,6 +127,7 @@
 #include "vm_callinfo.h"
 #include "ractor_core.h"
 #include "yjit.h"
+#include "zjit.h"
 
 #include "builtin.h"
 #include "shape.h"
@@ -974,9 +975,12 @@ static inline void
 gc_validate_pc(VALUE obj)
 {
 #if RUBY_DEBUG
+    // IMEMOs and objects without a class (e.g managed id table) are not traceable
+    if (RB_TYPE_P(obj, T_IMEMO) || !CLASS_OF(obj)) return;
+
     rb_execution_context_t *ec = GET_EC();
     const rb_control_frame_t *cfp = ec->cfp;
-    if (!RB_TYPE_P(obj, T_IMEMO) && cfp && VM_FRAME_RUBYFRAME_P(cfp) && cfp->pc) {
+    if (cfp && VM_FRAME_RUBYFRAME_P(cfp) && cfp->pc) {
         const VALUE *iseq_encoded = ISEQ_BODY(cfp->iseq)->iseq_encoded;
         const VALUE *iseq_encoded_end = iseq_encoded + ISEQ_BODY(cfp->iseq)->iseq_size;
         RUBY_ASSERT(cfp->pc >= iseq_encoded, "PC not set when allocating, breaking tracing");
@@ -1156,13 +1160,6 @@ rb_objspace_data_type_name(VALUE obj)
     }
 }
 
-static enum rb_id_table_iterator_result
-cvar_table_free_i(VALUE value, void *ctx)
-{
-    xfree((void *)value);
-    return ID_TABLE_CONTINUE;
-}
-
 static void
 io_fptr_finalize(void *fptr)
 {
@@ -1229,26 +1226,9 @@ struct classext_foreach_args {
 static void
 classext_free(rb_classext_t *ext, bool is_prime, VALUE namespace, void *arg)
 {
-    struct rb_id_table *tbl;
     struct classext_foreach_args *args = (struct classext_foreach_args *)arg;
 
-    rb_id_table_free(RCLASSEXT_M_TBL(ext));
-
-    if (!RCLASSEXT_SHARED_CONST_TBL(ext) && (tbl = RCLASSEXT_CONST_TBL(ext)) != NULL) {
-        rb_free_const_table(tbl);
-    }
-    if ((tbl = RCLASSEXT_CVC_TBL(ext)) != NULL) {
-        rb_id_table_foreach_values(tbl, cvar_table_free_i, NULL);
-        rb_id_table_free(tbl);
-    }
-    rb_class_classext_free_subclasses(ext, args->klass);
-    if (RCLASSEXT_SUPERCLASSES_WITH_SELF(ext)) {
-        RUBY_ASSERT(is_prime); // superclasses should only be used on prime
-        xfree(RCLASSEXT_SUPERCLASSES(ext));
-    }
-    if (!is_prime) { // the prime classext will be freed with RClass
-        xfree(ext);
-    }
+    rb_class_classext_free(args->klass, ext, is_prime);
 }
 
 static void
@@ -1256,19 +1236,7 @@ classext_iclass_free(rb_classext_t *ext, bool is_prime, VALUE namespace, void *a
 {
     struct classext_foreach_args *args = (struct classext_foreach_args *)arg;
 
-    if (RCLASSEXT_ICLASS_IS_ORIGIN(ext) && !RCLASSEXT_ICLASS_ORIGIN_SHARED_MTBL(ext)) {
-        /* Method table is not shared for origin iclasses of classes */
-        rb_id_table_free(RCLASSEXT_M_TBL(ext));
-    }
-    if (RCLASSEXT_CALLABLE_M_TBL(ext) != NULL) {
-        rb_id_table_free(RCLASSEXT_CALLABLE_M_TBL(ext));
-    }
-
-    rb_class_classext_free_subclasses(ext, args->klass);
-
-    if (!is_prime) { // the prime classext will be freed with RClass
-        xfree(ext);
-    }
+    rb_iclass_classext_free(args->klass, ext, is_prime);
 }
 
 bool
@@ -1307,6 +1275,9 @@ rb_gc_obj_free(void *objspace, VALUE obj)
         break;
       case T_MODULE:
       case T_CLASS:
+#if USE_ZJIT
+        rb_zjit_klass_free(obj);
+#endif
         args.klass = obj;
         rb_class_classext_foreach(obj, classext_free, (void *)&args);
         if (RCLASS_CLASSEXT_TBL(obj)) {
@@ -2833,13 +2804,24 @@ mark_m_tbl(void *objspace, struct rb_id_table *tbl)
     }
 }
 
+bool rb_gc_impl_checking_shareable(void *objspace_ptr); // in defaut/deafult.c
+
+bool
+rb_gc_checking_shareable(void)
+{
+    return rb_gc_impl_checking_shareable(rb_gc_get_objspace());
+}
+
+
 static enum rb_id_table_iterator_result
 mark_const_entry_i(VALUE value, void *objspace)
 {
     const rb_const_entry_t *ce = (const rb_const_entry_t *)value;
 
-    gc_mark_internal(ce->value);
-    gc_mark_internal(ce->file);
+    if (!rb_gc_impl_checking_shareable(objspace)) {
+        gc_mark_internal(ce->value);
+        gc_mark_internal(ce->file); // TODO: ce->file should be shareable?
+    }
     return ID_TABLE_CONTINUE;
 }
 
@@ -3066,6 +3048,14 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     }
 #endif
 
+#if USE_ZJIT
+    void rb_zjit_root_mark(void);
+    if (rb_zjit_enabled_p) {
+        MARK_CHECKPOINT("ZJIT");
+        rb_zjit_root_mark();
+    }
+#endif
+
     MARK_CHECKPOINT("machine_context");
     mark_current_machine_context(ec);
 
@@ -3092,7 +3082,12 @@ gc_mark_classext_module(rb_classext_t *ext, bool prime, VALUE namespace, void *a
         gc_mark_internal(RCLASSEXT_SUPER(ext));
     }
     mark_m_tbl(objspace, RCLASSEXT_M_TBL(ext));
-    gc_mark_internal(RCLASSEXT_FIELDS_OBJ(ext));
+
+    if (!rb_gc_impl_checking_shareable(objspace)) {
+        // unshareable
+        gc_mark_internal(RCLASSEXT_FIELDS_OBJ(ext));
+    }
+
     if (!RCLASSEXT_SHARED_CONST_TBL(ext) && RCLASSEXT_CONST_TBL(ext)) {
         mark_const_tbl(objspace, RCLASSEXT_CONST_TBL(ext));
     }
@@ -3158,7 +3153,8 @@ rb_gc_mark_children(void *objspace, VALUE obj)
 
     switch (BUILTIN_TYPE(obj)) {
       case T_CLASS:
-        if (FL_TEST_RAW(obj, FL_SINGLETON)) {
+        if (FL_TEST_RAW(obj, FL_SINGLETON) &&
+            !rb_gc_impl_checking_shareable(objspace)) {
             gc_mark_internal(RCLASS_ATTACHED_OBJECT(obj));
         }
         // Continue to the shared T_CLASS/T_MODULE
@@ -4101,6 +4097,14 @@ rb_gc_update_vm_references(void *objspace)
 
     if (rb_yjit_enabled_p) {
         rb_yjit_root_update_references();
+    }
+#endif
+
+#if USE_ZJIT
+    void rb_zjit_root_update_references(void); // in Rust
+
+    if (rb_zjit_enabled_p) {
+        rb_zjit_root_update_references();
     }
 #endif
 }
@@ -5421,6 +5425,18 @@ void
 rb_gc_after_fork(rb_pid_t pid)
 {
     rb_gc_impl_after_fork(rb_gc_get_objspace(), pid);
+}
+
+bool
+rb_gc_obj_shareable_p(VALUE obj)
+{
+    return RB_OBJ_SHAREABLE_P(obj);
+}
+
+void
+rb_gc_rp(VALUE obj)
+{
+    rp(obj);
 }
 
 /*

@@ -6912,7 +6912,7 @@ static const rb_data_type_t env_data_type = {
  *  A \Hash object maps each of its unique keys to a specific value.
  *
  *  A hash has certain similarities to an Array, but:
-
+ *
  *  - An array index is always an integer.
  *  - A hash key can be (almost) any object.
  *
@@ -7313,7 +7313,7 @@ static const rb_data_type_t env_data_type = {
  *  - #keys: Returns an array containing all keys in +self+.
  *  - #rassoc: Returns a 2-element array consisting of the key and value
  *    of the first-found entry having a given value.
- *  - #values: Returns an array containing all values in +self+/
+ *  - #values: Returns an array containing all values in +self+.
  *  - #values_at: Returns an array containing values for given keys.
  *
  *  ==== Methods for Assigning
@@ -7362,7 +7362,6 @@ static const rb_data_type_t env_data_type = {
  *
  *  ==== Methods for Transforming Keys and Values
  *
- *  - #flatten!: Returns +self+, flattened.
  *  - #invert: Returns a hash with the each key-value pair inverted.
  *  - #transform_keys: Returns a copy of +self+ with modified keys.
  *  - #transform_keys!: Modifies keys in +self+
@@ -7475,6 +7474,7 @@ Init_Hash(void)
     rb_define_singleton_method(rb_cHash, "ruby2_keywords_hash", rb_hash_s_ruby2_keywords_hash, 1);
 
     rb_cHash_empty_frozen = rb_hash_freeze(rb_hash_new());
+    RB_OBJ_SET_SHAREABLE(rb_cHash_empty_frozen);
     rb_vm_register_global_object(rb_cHash_empty_frozen);
 
     /* Document-class: ENV
@@ -7644,8 +7644,7 @@ Init_Hash(void)
     origenviron = environ;
     envtbl = TypedData_Wrap_Struct(rb_cObject, &env_data_type, NULL);
     rb_extend_object(envtbl, rb_mEnumerable);
-    FL_SET_RAW(envtbl, RUBY_FL_SHAREABLE);
-
+    RB_OBJ_SET_SHAREABLE(envtbl);
 
     rb_define_singleton_method(envtbl, "[]", rb_f_getenv, 1);
     rb_define_singleton_method(envtbl, "fetch", env_fetch, -1);

@@ -308,6 +308,39 @@ class TestZJIT < Test::Unit::TestCase
     }
   end
 
+  def test_optional_arguments
+    assert_compiles '[[1, 2, 3], [10, 20, 3], [100, 200, 300]]', %q{
+      def test(a, b = 2, c = 3)
+        [a, b, c]
+      end
+      [test(1), test(10, 20), test(100, 200, 300)]
+    }
+  end
+
+  def test_optional_arguments_setlocal
+    assert_compiles '[[2, 2], [1, nil]]', %q{
+      def test(a = (b = 2))
+        [a, b]
+      end
+      [test, test(1)]
+    }
+  end
+
+  def test_optional_arguments_cyclic
+    assert_compiles '[nil, 1]', %q{
+      test = proc { |a=a| a }
+      [test.call, test.call(1)]
+    }
+  end
+
+  def test_optional_arguments_side_exit
+    # This leads to FailedOptionalArguments, so not using assert_compiles
+    assert_runs '[:foo, nil, 1]', %q{
+      def test(a = (def foo = nil)) = a
+      [test, (undef :foo), test(1)]
+    }
+  end
+
   def test_getblockparamproxy
     assert_compiles '1', %q{
       def test(&block)
@@ -540,7 +573,8 @@ class TestZJIT < Test::Unit::TestCase
   end
 
   def test_invokebuiltin
-    assert_compiles '["."]', %q{
+    # Not using assert_compiles due to register spill
+    assert_runs '["."]', %q{
       def test = Dir.glob(".")
       test
     }
@@ -760,39 +794,69 @@ class TestZJIT < Test::Unit::TestCase
   end
 
   def test_fixnum_and
-    assert_compiles '1', %q{
+    assert_compiles '[1, 2, 4]', %q{
       def test(a, b) = a & b
-      test(2, 2)
-      test(2, 2)
-      test(5, 3)
+      [
+        test(5, 3),
+        test(0b011, 0b110),
+        test(-0b011, 0b110)
+      ]
     }, call_threshold: 2, insns: [:opt_and]
   end
 
   def test_fixnum_and_side_exit
-    assert_compiles 'false', %q{
+    assert_compiles '[2, 2, false]', %q{
       def test(a, b) = a & b
-      test(2, 2)
-      test(2, 2)
-      test(true, false)
+      [
+        test(2, 2),
+        test(0b011, 0b110),
+        test(true, false)
+      ]
     }, call_threshold: 2, insns: [:opt_and]
   end
 
   def test_fixnum_or
-    assert_compiles '3', %q{
+    assert_compiles '[7, 3, -3]', %q{
       def test(a, b) = a | b
-      test(5, 3)
-      test(5, 3)
-      test(1, 2)
+      [
+        test(5, 3),
+        test(1, 2),
+        test(1, -4)
+      ]
     }, call_threshold: 2, insns: [:opt_or]
   end
 
   def test_fixnum_or_side_exit
-    assert_compiles 'true', %q{
+    assert_compiles '[3, 2, true]', %q{
       def test(a, b) = a | b
-      test(2, 2)
-      test(2, 2)
-      test(true, false)
+      [
+        test(1, 2),
+        test(2, 2),
+        test(true, false)
+      ]
     }, call_threshold: 2, insns: [:opt_or]
+  end
+
+  def test_fixnum_xor
+    assert_compiles '[6, -8, 3]', %q{
+      def test(a, b) = a ^ b
+      [
+        test(5, 3),
+        test(-5, 3),
+        test(1, 2)
+      ]
+    }, call_threshold: 2
+  end
+
+  def test_fixnum_xor_side_exit
+    assert_compiles '[6, 6, true]', %q{
+      def test(a, b) = a ^ b
+      [
+        test(5, 3),
+        test(5, 3),
+        test(true, false)
+      ]
+    }, call_threshold: 2
   end
 
   def test_fixnum_mul
@@ -1117,6 +1181,14 @@ class TestZJIT < Test::Unit::TestCase
       def test = [1,2,3]
       test
     }
+  end
+
+  def test_array_fixnum_aref
+    assert_compiles '3', %q{
+      def test(x) = [1,2,3][x]
+      test(2)
+      test(2)
+    }, call_threshold: 2, insns: [:opt_aref]
   end
 
   def test_new_range_inclusive
@@ -1519,7 +1591,9 @@ class TestZJIT < Test::Unit::TestCase
   def test_forty_param_method
     # This used to a trigger a miscomp on A64 due
     # to a memory displacement larger than 9 bits.
-    assert_compiles '1', %Q{
+    # Using assert_runs again due to register spill.
+    # TODO: It should be fixed by register spill support.
+    assert_runs '1', %Q{
       def foo(#{'_,' * 39} n40) = n40
 
       foo(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1)
@@ -1590,6 +1664,57 @@ class TestZJIT < Test::Unit::TestCase
     }
   end
 
+  def test_getclassvariable
+    assert_compiles '42', %q{
+      class Foo
+        def self.test = @@x
+      end
+
+      Foo.class_variable_set(:@@x, 42)
+      Foo.test()
+    }
+  end
+
+  def test_getclassvariable_raises
+    assert_compiles '"uninitialized class variable @@x in Foo"', %q{
+      class Foo
+        def self.test = @@x
+      end
+
+      begin
+        Foo.test
+      rescue NameError => e
+        e.message
+      end
+    }
+  end
+
+  def test_setclassvariable
+    assert_compiles '42', %q{
+      class Foo
+        def self.test = @@x = 42
+      end
+
+      Foo.test()
+      Foo.class_variable_get(:@@x)
+    }
+  end
+
+  def test_setclassvariable_raises
+    assert_compiles '"can\'t modify frozen #<Class:Foo>: Foo"', %q{
+      class Foo
+        def self.test = @@x = 42
+        freeze
+      end
+
+      begin
+        Foo.test
+      rescue FrozenError => e
+        e.message
+      end
+    }
+  end
+
   def test_attr_reader
     assert_compiles '[4, 4]', %q{
       class C
@@ -1606,7 +1731,7 @@ class TestZJIT < Test::Unit::TestCase
     }, call_threshold: 2, insns: [:opt_send_without_block]
   end
 
-  def test_attr_accessor
+  def test_attr_accessor_getivar
     assert_compiles '[4, 4]', %q{
       class C
         attr_accessor :foo
@@ -1622,11 +1747,82 @@ class TestZJIT < Test::Unit::TestCase
     }, call_threshold: 2, insns: [:opt_send_without_block]
   end
 
+  def test_attr_accessor_setivar
+    assert_compiles '[5, 5]', %q{
+      class C
+        attr_accessor :foo
+
+        def initialize
+          @foo = 4
+        end
+      end
+
+      def test(c)
+        c.foo = 5
+        c.foo
+      end
+
+      c = C.new
+      [test(c), test(c)]
+    }, call_threshold: 2, insns: [:opt_send_without_block]
+  end
+
+  def test_attr_writer
+    assert_compiles '[5, 5]', %q{
+      class C
+        attr_writer :foo
+
+        def initialize
+          @foo = 4
+        end
+
+        def get_foo = @foo
+      end
+
+      def test(c)
+        c.foo = 5
+        c.get_foo
+      end
+      c = C.new
+      [test(c), test(c)]
+    }, call_threshold: 2, insns: [:opt_send_without_block]
+  end
+
   def test_uncached_getconstant_path
     assert_compiles RUBY_COPYRIGHT.dump, %q{
       def test = RUBY_COPYRIGHT
       test
     }, call_threshold: 1, insns: [:opt_getconstant_path]
+  end
+
+  def test_expandarray_no_splat
+    assert_compiles '[3, 4]', %q{
+      def test(o)
+        a, b = o
+        [a, b]
+      end
+      test [3, 4]
+    }, call_threshold: 1, insns: [:expandarray]
+  end
+
+  def test_expandarray_splat
+    assert_compiles '[3, [4]]', %q{
+      def test(o)
+        a, *b = o
+        [a, b]
+      end
+      test [3, 4]
+    }, call_threshold: 1, insns: [:expandarray]
+  end
+
+  def test_expandarray_splat_post
+    assert_compiles '[3, [4], 5]', %q{
+      def test(o)
+        a, *b, c = o
+        [a, b, c]
+      end
+      test [3, 4, 5]
+    }, call_threshold: 1, insns: [:expandarray]
   end
 
   def test_getconstant_path_autoload
@@ -1811,6 +2007,27 @@ class TestZJIT < Test::Unit::TestCase
     assert_compiles '[nil, nil, "yield"]', %q{
       def test
         yield_self { yield_self { defined?(yield) } }
+      end
+
+      [test, test, test{}]
+    }, call_threshold: 2
+  end
+
+  def test_block_given_p
+    assert_compiles "false", "block_given?"
+    assert_compiles '[false, false, true]', %q{
+      def test = block_given?
+      [test, test, test{}]
+    }, call_threshold: 2, insns: [:opt_send_without_block]
+  end
+
+  def test_block_given_p_from_block
+    # This will do some EP hopping to find the local EP,
+    # so it's slightly different than doing it outside of a block.
+
+    assert_compiles '[false, false, true]', %q{
+      def test
+        yield_self { yield_self { block_given? } }
       end
 
       [test, test, test{}]
@@ -2050,6 +2267,7 @@ class TestZJIT < Test::Unit::TestCase
         # After reset, counters should be zero or at least much smaller
         # (some instructions might execute between reset and reading stats)
         :zjit_insn_count.then { |s| initial_stats[s] > 0 && reset_stats[s] < initial_stats[s] },
+        :compiled_iseq_count.then { |s| initial_stats[s] > 0 && reset_stats[s] < initial_stats[s] }
       ].all?
     }, stats: true
   end
@@ -2833,6 +3051,65 @@ class TestZJIT < Test::Unit::TestCase
 
       a(Foo)
     }, call_threshold: 2, insns: [:opt_new]
+  end
+
+  def test_singleton_class_invalidation_annotated_ccall
+    assert_compiles '[false, true]', %q{
+      def define_singleton(obj, define)
+        if define
+          # Wrap in C method frame to avoid exiting JIT on defineclass
+          [nil].reverse_each do
+            class << obj
+              def ==(_)
+                true
+              end
+            end
+          end
+        end
+        false
+      end
+
+      def test(define)
+        obj = BasicObject.new
+        # This == call gets compiled to a CCall
+        obj == define_singleton(obj, define)
+      end
+
+      result = []
+      result << test(false)  # Compiles BasicObject#==
+      result << test(true)   # Should use singleton#== now
+      result
+    }, call_threshold: 2
+  end
+
+  def test_singleton_class_invalidation_optimized_variadic_ccall
+    assert_compiles '[1, 1000]', %q{
+      def define_singleton(arr, define)
+        if define
+          # Wrap in C method frame to avoid exiting JIT on defineclass
+          [nil].reverse_each do
+            class << arr
+              def push(x)
+                super(x * 1000)
+              end
+            end
+          end
+        end
+        1
+      end
+
+      def test(define)
+        arr = []
+        val = define_singleton(arr, define)
+        arr.push(val)  # This CCall should be invalidated if singleton was defined
+        arr[0]
+      end
+
+      result = []
+      result << test(false)  # Compiles Array#push as CCall
+      result << test(true)   # Singleton defined, CCall should be invalidated
+      result
+    }, call_threshold: 2
   end
 
   private

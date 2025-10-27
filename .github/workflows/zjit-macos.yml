@@ -101,9 +101,6 @@ jobs:
       - name: Run configure
         run: ../src/configure -C --disable-install-doc ${{ matrix.configure }}
 
-      - run: make prepare-gems
-        if: ${{ matrix.test_task == 'test-bundled-gems' }}
-
       - run: make
 
       - name: Verify that --zjit-dump-disasm works
@@ -136,7 +133,9 @@ jobs:
       - name: Dump crash logs
         if: ${{ failure() }}
         continue-on-error: true
-        run: tail --verbose --lines=+1 rb_crash_*.txt
+        run: |
+          tail --verbose --lines=+1 rb_crash_*.txt
+          exit 1
 
       - uses: ./.github/actions/slack
         with:

@@ -449,7 +449,7 @@ ruby_push_include(const char *path, VALUE (*filter)(VALUE))
 {
     const char sep = PATH_SEP_CHAR;
     const char *p, *s;
-    VALUE load_path = GET_VM()->load_path;
+    VALUE load_path = rb_root_namespace()->load_path;
 #ifdef __CYGWIN__
     char rubylib[FILENAME_MAX];
     VALUE buf = 0;
@@ -754,7 +754,7 @@ ruby_init_loadpath(void)
     rb_gc_register_address(&ruby_archlibdir_path);
     ruby_archlibdir_path = archlibdir;
 
-    load_path = GET_VM()->load_path;
+    load_path = rb_root_namespace()->load_path;
 
     ruby_push_include(getenv("RUBYLIB"), identical_path);
 
@@ -916,7 +916,9 @@ moreswitches(const char *s, ruby_cmdline_options_t *opt, int envopt)
     argc = RSTRING_LEN(argary) / sizeof(ap);
     ap = 0;
     rb_str_cat(argary, (char *)&ap, sizeof(ap));
-    argv = ptr = ALLOC_N(char *, argc);
+
+    VALUE ptr_obj;
+    argv = ptr = RB_ALLOCV_N(char *, ptr_obj, argc);
     MEMMOVE(argv, RSTRING_PTR(argary), char *, argc);
 
     while ((i = proc_options(argc, argv, opt, envopt)) > 1 && envopt && (argc -= i) > 0) {
@@ -948,7 +950,8 @@ moreswitches(const char *s, ruby_cmdline_options_t *opt, int envopt)
         opt->crash_report = crash_report;
     }
 
-    ruby_xfree(ptr);
+    RB_ALLOCV_END(ptr_obj);
+
     /* get rid of GC */
     rb_str_resize(argary, 0);
     rb_str_resize(argstr, 0);
@@ -1826,10 +1829,13 @@ ruby_opt_init(ruby_cmdline_options_t *opt)
     GET_VM()->running = 1;
     memset(ruby_vm_redefined_flag, 0, sizeof(ruby_vm_redefined_flag));
 
+    ruby_init_prelude();
+
+    /* Initialize the main namespace after loading libraries (including rubygems)
+     * to enable those in both root and main */
     if (rb_namespace_available())
         rb_initialize_main_namespace();
     rb_namespace_init_done();
-    ruby_init_prelude();
 
     // Initialize JITs after ruby_init_prelude() because JITing prelude is typically not optimal.
 #if USE_YJIT
@@ -2328,8 +2334,8 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
     char fbuf[MAXPATHLEN];
     int i = (int)proc_options(argc, argv, opt, 0);
     unsigned int dump = opt->dump & dump_exit_bits;
-    rb_vm_t *vm = GET_VM();
-    const long loaded_before_enc = RARRAY_LEN(vm->loaded_features);
+    const rb_namespace_t *ns = rb_root_namespace();
+    const long loaded_before_enc = RARRAY_LEN(ns->loaded_features);
 
     if (opt->dump & (DUMP_BIT(usage)|DUMP_BIT(help))) {
         const char *const progname =
@@ -2477,7 +2483,7 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
     rb_obj_freeze(opt->script_name);
     if (IF_UTF8_PATH(uenc != lenc, 1)) {
         long i;
-        VALUE load_path = vm->load_path;
+        VALUE load_path = ns->load_path;
         const ID id_initial_load_path_mark = INITIAL_LOAD_PATH_MARK;
         int modifiable = FALSE;
 
@@ -2500,11 +2506,11 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
             RARRAY_ASET(load_path, i, path);
         }
         if (modifiable) {
-            rb_ary_replace(vm->load_path_snapshot, load_path);
+            rb_ary_replace(ns->load_path_snapshot, load_path);
         }
     }
     {
-        VALUE loaded_features = vm->loaded_features;
+        VALUE loaded_features = ns->loaded_features;
         bool modified = false;
         for (long i = loaded_before_enc; i < RARRAY_LEN(loaded_features); ++i) {
             VALUE path = RARRAY_AREF(loaded_features, i);
@@ -2516,7 +2522,7 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
             RARRAY_ASET(loaded_features, i, path);
         }
         if (modified) {
-            rb_ary_replace(vm->loaded_features_snapshot, loaded_features);
+            rb_ary_replace(ns->loaded_features_snapshot, loaded_features);
         }
     }
 

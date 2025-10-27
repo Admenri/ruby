@@ -282,10 +282,15 @@ module Bundler
     end
 
     def filter_relevant(dependencies)
-      platforms_array = [Bundler.generic_local_platform].freeze
       dependencies.select do |d|
-        d.should_include? && !d.gem_platforms(platforms_array).empty?
+        relevant_deps?(d)
       end
+    end
+
+    def relevant_deps?(dep)
+      platforms_array = [Bundler.generic_local_platform].freeze
+
+      dep.should_include? && !dep.gem_platforms(platforms_array).empty?
     end
 
     def locked_dependencies
@@ -367,7 +372,7 @@ module Bundler
 
         msg = "`Definition#lock` was passed a target file argument. #{suggestion}"
 
-        Bundler::SharedHelpers.major_deprecation 2, msg
+        Bundler::SharedHelpers.feature_removed! msg
       end
 
       write_lock(target_lockfile, preserve_unknown_sections)
@@ -535,7 +540,18 @@ module Bundler
 
       setup_domain!(add_checksums: true)
 
-      specs # force materialization to real specifications, so that checksums are fetched
+      # force materialization to real specifications, so that checksums are fetched
+      specs.each do |spec|
+        next unless spec.source.is_a?(Bundler::Source::Rubygems)
+        # Checksum was fetched from the compact index API.
+        next if !spec.source.checksum_store.missing?(spec) && !spec.source.checksum_store.empty?(spec)
+        # The gem isn't installed, can't compute the checksum.
+        next unless spec.loaded_from
+
+        package = Gem::Package.new(spec.source.cached_built_in_gem(spec))
+        checksum = Checksum.from_gem_package(package)
+        spec.source.checksum_store.register(spec, checksum)
+      end
     end
 
     private
@@ -973,10 +989,11 @@ module Bundler
       @missing_lockfile_dep = nil
       @changed_dependencies = []
 
-      current_dependencies.each do |dep|
+      @dependencies.each do |dep|
         if dep.source
           dep.source = sources.get(dep.source)
         end
+        next unless relevant_deps?(dep)
 
         name = dep.name
 

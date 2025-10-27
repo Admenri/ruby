@@ -75,9 +75,18 @@ module Test
       require_relative 'envutil'
       require 'pp'
       begin
-        require '-test-/asan'
+        require '-test-/sanitizers'
       rescue LoadError
+        # in test-unit-ruby-core gem
+        def sanitizers
+          nil
+        end
+      else
+        def sanitizers
+          Test::Sanitizers
+        end
       end
+      module_function :sanitizers
 
       nil.pretty_inspect
 
@@ -97,9 +106,11 @@ module Test
       end
 
       def assert_in_out_err(args, test_stdin = "", test_stdout = [], test_stderr = [], message = nil,
-                            success: nil, failed: nil, **opt)
+                            success: nil, failed: nil, gems: false, **opt)
         args = Array(args).dup
-        args.insert((Hash === args[0] ? 1 : 0), '--disable=gems')
+        unless gems.nil?
+          args.insert((Hash === args[0] ? 1 : 0), "--#{gems ? 'enable' : 'disable'}=gems")
+        end
         stdout, stderr, status = EnvUtil.invoke_ruby(args, test_stdin, true, true, **opt)
         desc = failed[status, message, stderr] if failed
         desc ||= FailDesc[status, message, stderr]
@@ -160,7 +171,7 @@ module Test
         pend 'assert_no_memory_leak may consider MJIT memory usage as leak' if defined?(RubyVM::MJIT) && RubyVM::MJIT.enabled?
         # ASAN has the same problem - its shadow memory greatly increases memory usage
         # (plus asan has better ways to detect memory leaks than this assertion)
-        pend 'assert_no_memory_leak may consider ASAN memory usage as leak' if defined?(Test::ASAN) && Test::ASAN.enabled?
+        pend 'assert_no_memory_leak may consider ASAN memory usage as leak' if sanitizers&.asan_enabled?
 
         require_relative 'memory_status'
         raise Test::Unit::PendedError, "unsupported platform" unless defined?(Memory::Status)
@@ -329,6 +340,13 @@ eom
         args.insert((Hash === args.first ? 1 : 0), "-w", "--disable=gems", *$:.map {|l| "-I#{l}"})
         args << "--debug" if RUBY_ENGINE == 'jruby' # warning: tracing (e.g. set_trace_func) will not capture all events without --debug flag
         stdout, stderr, status = EnvUtil.invoke_ruby(args, src, capture_stdout, true, **opt)
+
+        if sanitizers&.lsan_enabled?
+          # LSAN may output messages like the following line into stderr. We should ignore it.
+          #   ==276855==Running thread 276851 was not suspended. False leaks are possible.
+          # See https://github.com/google/sanitizers/issues/1479
+          stderr.gsub!(/==\d+==Running thread \d+ was not suspended\. False leaks are possible\.\n/, "")
+        end
       ensure
         if res_c
           res_c.close
@@ -832,6 +850,9 @@ eom
             rescue
               # Constants may be defined but not implemented, e.g., mingw.
             else
+              unless Process.clock_getres(clk) < 1.0e-03
+                next # needs msec precision
+              end
               PERFORMANCE_CLOCK = clk
             end
           end

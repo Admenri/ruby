@@ -90,7 +90,7 @@
 
 use std::convert::From;
 use std::ffi::{c_void, CString, CStr};
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::panic::{catch_unwind, UnwindSafe};
 
@@ -132,7 +132,9 @@ unsafe extern "C" {
     pub fn rb_hash_empty_p(hash: VALUE) -> VALUE;
     pub fn rb_yjit_str_concat_codepoint(str: VALUE, codepoint: VALUE);
     pub fn rb_str_setbyte(str: VALUE, index: VALUE, value: VALUE) -> VALUE;
+    pub fn rb_str_getbyte(str: VALUE, index: VALUE) -> VALUE;
     pub fn rb_vm_splat_array(flag: VALUE, ary: VALUE) -> VALUE;
+    pub fn rb_jit_fix_mod_fix(x: VALUE, y: VALUE) -> VALUE;
     pub fn rb_vm_concat_array(ary1: VALUE, ary2st: VALUE) -> VALUE;
     pub fn rb_vm_get_special_object(reg_ep: *const VALUE, value_type: vm_special_object_type) -> VALUE;
     pub fn rb_vm_concat_to_array(ary1: VALUE, ary2st: VALUE) -> VALUE;
@@ -218,6 +220,7 @@ pub use rb_vm_ci_kwarg as vm_ci_kwarg;
 pub use rb_METHOD_ENTRY_VISI as METHOD_ENTRY_VISI;
 pub use rb_RCLASS_ORIGIN as RCLASS_ORIGIN;
 pub use rb_vm_get_special_object as vm_get_special_object;
+pub use rb_jit_fix_mod_fix as rb_fix_mod_fix;
 
 /// Helper so we can get a Rust string for insn_name()
 pub fn insn_name(opcode: usize) -> String {
@@ -270,7 +273,7 @@ pub type IseqPtr = *const rb_iseq_t;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ShapeId(pub u32);
 
-pub const INVALID_SHAPE_ID: ShapeId = ShapeId(RB_INVALID_SHAPE_ID);
+pub const INVALID_SHAPE_ID: ShapeId = ShapeId(rb_invalid_shape_id);
 
 impl ShapeId {
     pub fn is_valid(self) -> bool {
@@ -294,7 +297,10 @@ pub fn iseq_opcode_at_idx(iseq: IseqPtr, insn_idx: u32) -> u32 {
     unsafe { rb_iseq_opcode_at_pc(iseq, pc) as u32 }
 }
 
-/// Return true if the ISEQ always uses a frame with escaped EP.
+/// Return true if a given ISEQ is known to escape EP to the heap on entry.
+///
+/// As of vm_push_frame(), EP is always equal to BP. However, after pushing
+/// a frame, some ISEQ setups call vm_bind_update_env(), which redirects EP.
 pub fn iseq_escapes_ep(iseq: IseqPtr) -> bool {
     match unsafe { get_iseq_body_type(iseq) } {
         // The EP of the <main> frame points to TOPLEVEL_BINDING
@@ -302,6 +308,17 @@ pub fn iseq_escapes_ep(iseq: IseqPtr) -> bool {
         // eval frames point to the EP of another frame or scope
         ISEQ_TYPE_EVAL => true,
         _ => false,
+    }
+}
+
+/// Index of the local variable that has a rest parameter if any
+pub fn iseq_rest_param_idx(iseq: IseqPtr) -> Option<i32> {
+    if !iseq.is_null() && unsafe { get_iseq_flags_has_rest(iseq) } {
+        let opt_num = unsafe { get_iseq_body_param_opt_num(iseq) };
+        let lead_num = unsafe { get_iseq_body_param_lead_num(iseq) };
+        Some(opt_num + lead_num)
+    } else {
+        None
     }
 }
 
@@ -386,10 +403,27 @@ pub enum ClassRelationship {
     NoRelation,
 }
 
+/// A print adapator for debug info about a [VALUE]. Includes info
+/// the GC knows about the handle. Example: `println!("{}", value.obj_info());`.
+pub struct ObjInfoPrinter(VALUE);
+
+impl Display for ObjInfoPrinter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use std::mem::MaybeUninit;
+        const BUFFER_SIZE: usize = 0x100;
+        let mut buffer: MaybeUninit<[c_char; BUFFER_SIZE]> = MaybeUninit::uninit();
+        let info = unsafe {
+            rb_raw_obj_info(buffer.as_mut_ptr().cast(), BUFFER_SIZE, self.0);
+            CStr::from_ptr(buffer.as_ptr().cast()).to_string_lossy()
+        };
+        write!(f, "{info}")
+    }
+}
+
 impl VALUE {
-    /// Dump info about the value to the console similarly to rp(VALUE)
-    pub fn dump_info(self) {
-        unsafe { rb_obj_info_dump(self) }
+    /// Get a printer for raw debug info from `rb_obj_info()` about the value.
+    pub fn obj_info(self) -> ObjInfoPrinter {
+        ObjInfoPrinter(self)
     }
 
     /// Return whether the value is truthy or falsy in Ruby -- only nil and false are falsy.
@@ -416,6 +450,11 @@ impl VALUE {
         !self.special_const_p()
     }
 
+    /// Shareability between ractors. `RB_OBJ_SHAREABLE_P()`.
+    pub fn shareable_p(self) -> bool {
+        (self.builtin_flags() & RUBY_FL_SHAREABLE as usize) != 0
+    }
+
     /// Return true if the value is a Ruby Fixnum (immediate-size integer)
     pub fn fixnum_p(self) -> bool {
         let VALUE(cval) = self;
@@ -434,6 +473,16 @@ impl VALUE {
     /// Return true if the value is a Ruby symbol (RB_SYMBOL_P)
     pub fn symbol_p(self) -> bool {
         self.static_sym_p() || self.dynamic_sym_p()
+    }
+
+    pub fn instance_can_have_singleton_class(self) -> bool {
+        if self == unsafe { rb_cInteger } || self == unsafe { rb_cFloat } ||
+            self == unsafe { rb_cSymbol } || self == unsafe { rb_cNilClass } ||
+            self == unsafe { rb_cTrueClass } || self == unsafe { rb_cFalseClass } {
+
+            return false
+        }
+        true
     }
 
     /// Return true for a static (non-heap) Ruby symbol (RB_STATIC_SYM_P)
@@ -483,8 +532,11 @@ impl VALUE {
     pub fn class_of(self) -> VALUE {
         if !self.special_const_p() {
             let builtin_type = self.builtin_type();
-            assert_ne!(builtin_type, RUBY_T_NONE, "ZJIT should only see live objects");
-            assert_ne!(builtin_type, RUBY_T_MOVED, "ZJIT should only see live objects");
+            assert!(
+                builtin_type != RUBY_T_NONE && builtin_type != RUBY_T_MOVED,
+                "ZJIT saw a dead object. T_type={builtin_type}, {}",
+                self.obj_info()
+            );
         }
 
         unsafe { rb_yarv_class_of(self) }
@@ -846,6 +898,14 @@ where
     let mut recursive_lock_level: c_uint = 0;
 
     unsafe { rb_jit_vm_lock_then_barrier(&mut recursive_lock_level, file, line) };
+    // Ensure GC is off while we have the VM lock because:
+    //   1. We create many transient Rust collections that hold VALUEs during compilation.
+    //      It's extremely tricky to properly marked and reference update these, not to
+    //      mention the overhead and ergonomics issues.
+    //   2. If we yield to the GC while compiling, it re-enters our mark and update functions.
+    //      This breaks `&mut` exclusivity since mark functions derive fresh `&mut` from statics
+    //      while there is a stack frame below it that has an overlapping `&mut`. That's UB.
+    let gc_disabled_pre_call = unsafe { rb_gc_disable() }.test();
 
     let ret = match catch_unwind(func) {
         Ok(result) => result,
@@ -865,7 +925,12 @@ where
         }
     };
 
-    unsafe { rb_jit_vm_unlock(&mut recursive_lock_level, file, line) };
+    unsafe {
+        if !gc_disabled_pre_call {
+            rb_gc_enable();
+        }
+        rb_jit_vm_unlock(&mut recursive_lock_level, file, line);
+    };
 
     ret
 }
@@ -1105,9 +1170,19 @@ pub mod test_utils {
         ruby_str_to_rust_string(eval(&inspect))
     }
 
-    /// Get the ISeq of a specified method
+    /// Get IseqPtr for a specified method
     pub fn get_method_iseq(recv: &str, name: &str) -> *const rb_iseq_t {
-        let wrapped_iseq = eval(&format!("RubyVM::InstructionSequence.of({}.method(:{}))", recv, name));
+        get_proc_iseq(&format!("{}.method(:{})", recv, name))
+    }
+
+    /// Get IseqPtr for a specified instance method
+    pub fn get_instance_method_iseq(recv: &str, name: &str) -> *const rb_iseq_t {
+        get_proc_iseq(&format!("{}.instance_method(:{})", recv, name))
+    }
+
+    /// Get IseqPtr for a specified Proc object
+    pub fn get_proc_iseq(obj: &str) -> *const rb_iseq_t {
+        let wrapped_iseq = eval(&format!("RubyVM::InstructionSequence.of({obj})"));
         unsafe { rb_iseqw_to_iseq(wrapped_iseq) }
     }
 
@@ -1272,6 +1347,7 @@ pub(crate) mod ids {
         name: NULL               content: b""
         name: respond_to_missing content: b"respond_to_missing?"
         name: eq                 content: b"=="
+        name: string_eq          content: b"String#=="
         name: include_p          content: b"include?"
         name: to_ary
         name: to_s
@@ -1289,6 +1365,7 @@ pub(crate) mod ids {
         name: ge                 content: b">="
         name: and                content: b"&"
         name: or                 content: b"|"
+        name: xor                content: b"^"
         name: freeze
         name: minusat            content: b"-@"
         name: aref               content: b"[]"

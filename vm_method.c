@@ -184,7 +184,7 @@ vm_ccs_invalidate(struct rb_class_cc_entries *ccs)
     }
 }
 
-void
+static void
 rb_vm_ccs_invalidate_and_free(struct rb_class_cc_entries *ccs)
 {
     RB_DEBUG_COUNTER_INC(ccs_free);
@@ -195,8 +195,9 @@ rb_vm_ccs_invalidate_and_free(struct rb_class_cc_entries *ccs)
 void
 rb_vm_cc_table_delete(VALUE table, ID mid)
 {
-    struct rb_class_cc_entries *ccs;
-    if (rb_managed_id_table_lookup(table, mid, (VALUE *)&ccs)) {
+    VALUE ccs_obj;
+    if (rb_managed_id_table_lookup(table, mid, &ccs_obj)) {
+        struct rb_class_cc_entries *ccs = (struct rb_class_cc_entries *)ccs_obj;
         rb_managed_id_table_delete(table, mid);
         rb_vm_ccs_invalidate_and_free(ccs);
     }
@@ -681,7 +682,7 @@ rb_vm_ci_lookup(ID mid, unsigned int flag, unsigned int argc, const struct rb_ca
         ((struct rb_callinfo_kwarg *)kwarg)->references++;
     }
 
-    struct rb_callinfo *new_ci = IMEMO_NEW(struct rb_callinfo, imemo_callinfo, (VALUE)kwarg);
+    struct rb_callinfo *new_ci = SHAREABLE_IMEMO_NEW(struct rb_callinfo, imemo_callinfo, (VALUE)kwarg);
     new_ci->mid = mid;
     new_ci->flag = flag;
     new_ci->argc = argc;
@@ -859,6 +860,17 @@ rb_free_method_entry_vm_weak_references(const rb_method_entry_t *me)
 void
 rb_free_method_entry(const rb_method_entry_t *me)
 {
+#if USE_ZJIT
+    if (METHOD_ENTRY_CACHED(me)) {
+        rb_zjit_cme_free((const rb_callable_method_entry_t *)me);
+    }
+#endif
+
+#if USE_YJIT
+    // YJIT rb_yjit_root_mark() roots CMEs in `Invariants`,
+    // to remove from `Invariants` here.
+#endif
+
     rb_method_definition_release(me->def);
 }
 
@@ -996,7 +1008,9 @@ rb_method_definition_set(const rb_method_entry_t *me, rb_method_definition_t *de
 
                 if (cfp && (line = rb_vm_get_sourceline(cfp))) {
                     VALUE location = rb_ary_new3(2, rb_iseq_path(cfp->iseq), INT2FIX(line));
-                    RB_OBJ_WRITE(me, &def->body.attr.location, rb_ary_freeze(location));
+                    rb_ary_freeze(location);
+                    RB_OBJ_SET_SHAREABLE(location);
+                    RB_OBJ_WRITE(me, &def->body.attr.location, location);
                 }
                 else {
                     VM_ASSERT(def->body.attr.location == 0);
@@ -1087,7 +1101,7 @@ rb_method_entry_alloc(ID called_id, VALUE owner, VALUE defined_class, rb_method_
         // not negative cache
         VM_ASSERT_TYPE2(defined_class, T_CLASS, T_ICLASS);
     }
-    rb_method_entry_t *me = IMEMO_NEW(rb_method_entry_t, imemo_ment, defined_class);
+    rb_method_entry_t *me = SHAREABLE_IMEMO_NEW(rb_method_entry_t, imemo_ment, defined_class);
     *((rb_method_definition_t **)&me->def) = def;
     me->called_id = called_id;
     me->owner = owner;

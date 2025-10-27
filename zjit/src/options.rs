@@ -3,27 +3,30 @@
 use std::{ffi::{CStr, CString}, ptr::null};
 use std::os::raw::{c_char, c_int, c_uint};
 use crate::cruby::*;
+use crate::stats::Counter;
 use std::collections::HashSet;
 
 /// Default --zjit-num-profiles
-const DEFAULT_NUM_PROFILES: u8 = 5;
+const DEFAULT_NUM_PROFILES: NumProfiles = 5;
+pub type NumProfiles = u32;
 
 /// Default --zjit-call-threshold. This should be large enough to avoid compiling
 /// warmup code, but small enough to perform well on micro-benchmarks.
-pub const DEFAULT_CALL_THRESHOLD: u64 = 30;
+pub const DEFAULT_CALL_THRESHOLD: CallThreshold = 30;
+pub type CallThreshold = u64;
 
 /// Number of calls to start profiling YARV instructions.
 /// They are profiled `rb_zjit_call_threshold - rb_zjit_profile_threshold` times,
 /// which is equal to --zjit-num-profiles.
 #[unsafe(no_mangle)]
 #[allow(non_upper_case_globals)]
-pub static mut rb_zjit_profile_threshold: u64 = DEFAULT_CALL_THRESHOLD - DEFAULT_NUM_PROFILES as u64;
+pub static mut rb_zjit_profile_threshold: CallThreshold = DEFAULT_CALL_THRESHOLD - DEFAULT_NUM_PROFILES as CallThreshold;
 
 /// Number of calls to compile ISEQ with ZJIT at jit_compile() in vm.c.
 /// --zjit-call-threshold=1 compiles on first execution without profiling information.
 #[unsafe(no_mangle)]
 #[allow(non_upper_case_globals)]
-pub static mut rb_zjit_call_threshold: u64 = DEFAULT_CALL_THRESHOLD;
+pub static mut rb_zjit_call_threshold: CallThreshold = DEFAULT_CALL_THRESHOLD;
 
 /// ZJIT command-line options. This is set before rb_zjit_init() sets
 /// ZJITState so that we can query some options while loading builtins.
@@ -40,7 +43,7 @@ pub struct Options {
     pub mem_bytes: usize,
 
     /// Number of times YARV instructions should be profiled.
-    pub num_profiles: u8,
+    pub num_profiles: NumProfiles,
 
     /// Enable YJIT statsitics
     pub stats: bool,
@@ -69,6 +72,12 @@ pub struct Options {
     /// Dump all compiled machine code.
     pub dump_disasm: bool,
 
+    /// Trace and write side exit source maps to /tmp for stackprof.
+    pub trace_side_exits: Option<TraceExits>,
+
+    /// Frequency of tracing side exits.
+    pub trace_side_exits_sample_interval: usize,
+
     /// Dump code map to /tmp for performance profilers.
     pub perf: bool,
 
@@ -94,6 +103,8 @@ impl Default for Options {
             dump_hir_graphviz: None,
             dump_lir: false,
             dump_disasm: false,
+            trace_side_exits: None,
+            trace_side_exits_sample_interval: 0,
             perf: false,
             allowed_iseqs: None,
             log_compiled_iseqs: None,
@@ -108,14 +119,26 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
     ("--zjit-mem-size=num",
                      "Max amount of memory that ZJIT can use (in MiB)."),
     ("--zjit-call-threshold=num",
-                     "Number of calls to trigger JIT (default: 2)."),
+                     "Number of calls to trigger JIT (default: 30)."),
     ("--zjit-num-profiles=num",
-                     "Number of profiled calls before JIT (default: 1, max: 255)."),
+                     "Number of profiled calls before JIT (default: 5)."),
     ("--zjit-stats[=quiet]", "Enable collecting ZJIT statistics (=quiet to suppress output)."),
     ("--zjit-perf",  "Dump ISEQ symbols into /tmp/perf-{}.map for Linux perf."),
     ("--zjit-log-compiled-iseqs=path",
                      "Log compiled ISEQs to the file. The file will be truncated."),
+    ("--zjit-trace-exits[=counter]",
+                     "Record source on side-exit. `Counter` picks specific counter."),
+    ("--zjit-trace-exits-sample-rate=num",
+                     "Frequency at which to record side exits. Must be `usize`.")
 ];
+
+#[derive(Copy, Clone, Debug)]
+pub enum TraceExits {
+    // Trace all exits
+    All,
+    // Trace exits for a specific `Counter`
+    Counter(Counter),
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum DumpHIR {
@@ -235,6 +258,22 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             options.print_stats = false;
         }
 
+        ("trace-exits", exits) => {
+            options.trace_side_exits = match exits {
+                "" => Some(TraceExits::All),
+                name => Some(Counter::get(name).map(TraceExits::Counter)?),
+            }
+        }
+
+        ("trace-exits-sample-rate", sample_interval) => {
+            // If not already set, then set it to `TraceExits::All` by default.
+            if options.trace_side_exits.is_none() {
+                options.trace_side_exits = Some(TraceExits::All);
+            }
+            // `sample_interval ` must provide a string that can be validly parsed to a `usize`.
+            options.trace_side_exits_sample_interval = sample_interval.parse::<usize>().ok()?;
+        }
+
         ("debug", "") => options.debug = true,
 
         ("disable-hir-opt", "") => options.disable_hir_opt = true,
@@ -296,15 +335,15 @@ fn update_profile_threshold() {
         unsafe { rb_zjit_profile_threshold = 0; }
     } else {
         // Otherwise, profile instructions at least once.
-        let num_profiles = get_option!(num_profiles) as u64;
-        unsafe { rb_zjit_profile_threshold = rb_zjit_call_threshold.saturating_sub(num_profiles).max(1) };
+        let num_profiles = get_option!(num_profiles);
+        unsafe { rb_zjit_profile_threshold = rb_zjit_call_threshold.saturating_sub(num_profiles.into()).max(1) };
     }
 }
 
 /// Update --zjit-call-threshold for testing
 #[cfg(test)]
-pub fn set_call_threshold(call_threshold: u64) {
-    unsafe { rb_zjit_call_threshold = call_threshold as u64; }
+pub fn set_call_threshold(call_threshold: CallThreshold) {
+    unsafe { rb_zjit_call_threshold = call_threshold; }
     rb_zjit_prepare_options();
     update_profile_threshold();
 }
